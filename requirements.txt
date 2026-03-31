@@ -1,0 +1,15 @@
+transformers @ git+https://github.com/huggingface/transformers.git@main
+torch>=2.8.0
+accelerate>=1.8.0
+peft>=0.15.0
+mteb>=2.12.0
+sentence-transformers>=3.0.0
+qwen-vl-utils>=0.0.14
+datasets>=3.0.0
+decord>=0.6.0
+opencv-python-headless
+torchvision>=0.16.0
+deepspeed>=0.17.0
+pillow
+numpy
+scipy

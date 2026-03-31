@@ -1,0 +1,41 @@
+name,source_url,type,task,split,approx_size,stage,priority,notes
+MS-MARCO Passage,https://huggingface.co/datasets/microsoft/ms_marco,text,retrieval,train,500000,s0,high,Core retrieval dataset
+MS-MARCO Document,https://huggingface.co/datasets/microsoft/ms_marco,text,retrieval,train,70000,s0,medium,Long-document retrieval
+Natural Questions,https://huggingface.co/datasets/google-research-datasets/natural_questions,text,QA/retrieval,train,100000,s0,high,Open-domain QA retrieval
+TriviaQA,https://huggingface.co/datasets/mandarjoshi/trivia_qa,text,QA/retrieval,train,60000,s0,medium,Trivia-based QA pairs
+SQuAD v2,https://huggingface.co/datasets/rajpurkar/squad_v2,text,QA,train,130000,s0,medium,Reading comprehension QA
+HotpotQA,https://huggingface.co/datasets/hotpotqa/hotpot_qa,text,QA,train,90000,s0,medium,Multi-hop QA
+FEVER,https://huggingface.co/datasets/fever/fever,text,fact_verification,train,110000,s0,medium,Fact verification claims
+SNLI,https://huggingface.co/datasets/stanfordnlp/snli,text,NLI,train,570000,s1,high,Natural language inference
+MultiNLI,https://huggingface.co/datasets/nyu-mll/multi_nli,text,NLI,train,393000,s1,high,Multi-genre NLI
+STS Benchmark,https://huggingface.co/datasets/mteb/stsbenchmark-sts,text,STS,train,5700,s1,medium,Semantic textual similarity
+Quora Question Pairs,https://huggingface.co/datasets/quora,text,paraphrase,train,400000,s1,medium,Duplicate question detection
+DuReader Retrieval,https://huggingface.co/datasets/C-MTEB/DuRetrieval,text,retrieval_zh,train,86000,s1,medium,Chinese retrieval
+Mr. TyDi,https://huggingface.co/datasets/castorini/mr-tydi,text,retrieval_multilingual,train,50000,s1,medium,Multilingual retrieval 11 langs
+MIRACL,https://huggingface.co/datasets/miracl/miracl,text,retrieval_multilingual,train,100000,s1,high,Multilingual retrieval 18 langs
+ELI5,https://huggingface.co/datasets/eli5,text,QA,train,100000,s0,low,Long-form QA
+WikiAnswers,https://huggingface.co/datasets/wiki_qa,text,paraphrase,train,2000000,s0,low,Paraphrase pairs
+S2ORC,https://huggingface.co/datasets/allenai/s2orc,text,citation/retrieval,train,50000000,s0,low,Academic paper pairs
+NLI Triplets,https://huggingface.co/datasets/sentence-transformers/all-nli,text,NLI,train,940000,s1,high,"AllNLI combined SNLI+MultiNLI, with hard negatives"
+GooAQ,https://huggingface.co/datasets/sentence-transformers/gooaq,text,QA,train,3000000,s0,medium,Google auto-complete QA
+PAQ,https://huggingface.co/datasets/sentence-transformers/paq,text,QA,train,65000000,s0,low,Probably Asked Questions
+SPECTER,https://huggingface.co/datasets/allenai/specter,text,citation,train,684000,s0,medium,Citation-based paper pairs
+SimpleWiki,https://huggingface.co/datasets/sentence-transformers/simple-wiki,text,paraphrase,train,102000,s1,medium,Simple English Wikipedia pairs
+MEDI,https://huggingface.co/datasets/avsolatorio/medi-data,text,mixed_341tasks,train,1400000,s1,high,"Instruction-tuned triplets, 341 tasks"
+MEDI+MTEB,https://huggingface.co/datasets/avsolatorio/medi-data-mteb_avs_triplets,text,mixed,train,1800000,s1,high,MEDI + MTEB classification triplets
+TIGER-Lab/MMEB-train,https://huggingface.co/datasets/TIGER-Lab/MMEB-train,multimodal,mixed_20tasks,train,2100000,s0,high,Multimodal embedding training 20 tasks
+MS-COCO Captions,https://huggingface.co/datasets/HuggingFaceM4/COCO,image-text,retrieval,train,600000,s0,high,Image-caption retrieval pairs
+Flickr30k,https://huggingface.co/datasets/nlphuji/flickr30k,image-text,retrieval,train,150000,s0,medium,Image-caption retrieval
+CC3M,https://huggingface.co/datasets/pixparse/cc3m-wds,image-text,retrieval,train,3000000,s0,medium,Conceptual Captions 3M
+ScienceQA,https://huggingface.co/datasets/derek-thomas/ScienceQA,image-text,QA,train,21000,s1,medium,Multimodal science QA
+Visual Genome,https://huggingface.co/datasets/visual_genome,image-text,QA/retrieval,train,5400000,s0,medium,Dense image annotations
+ShareGPT4V,https://huggingface.co/datasets/Lin-Chen/ShareGPT4V,image-text,QA,train,100000,s1,medium,GPT4V-generated captions
+LLaVA-Instruct,https://huggingface.co/datasets/liuhaotian/LLaVA-Instruct-150K,image-text,QA,train,150000,s1,medium,Visual instruction tuning
+DocVQA,https://huggingface.co/datasets/lmms-lab/DocVQA,image-text,QA,train,40000,s1,medium,Document visual QA
+InfoVQA,https://huggingface.co/datasets/vidore/infovqa_test_subsampled,image-text,QA,test,500,s2,medium,Infographic VQA
+ChartQA,https://huggingface.co/datasets/HuggingFaceM4/ChartQA,image-text,QA,train,28000,s1,medium,Chart understanding QA
+NLLB,https://huggingface.co/datasets/allenai/nllb,text,bitext_mining,train,160000000,s0,low,Parallel translations 200+ langs
+Reddit Comments,https://huggingface.co/datasets/sentence-transformers/reddit-title-body,text,QA/paraphrase,train,160000000,s0,low,Reddit title-body pairs
+StackExchange,https://huggingface.co/datasets/flax-sentence-embeddings/stackexchange_title_body_jsonl,text,QA,train,18000000,s0,low,StackExchange Q&A pairs
+Wikipedia,https://huggingface.co/datasets/wikipedia,text,pretrain_pairs,train,150000000,s0,low,Wikipedia passages for weak supervision
+mC4,https://huggingface.co/datasets/mc4,text,pretrain_pairs,train,160000000,s0,low,Multilingual web text
