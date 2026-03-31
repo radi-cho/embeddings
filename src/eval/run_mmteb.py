@@ -23,6 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+QUICK_TASK = "STSBenchmark"
+
 FAST_TASKS = [
     "BUCC.v2",
     "AmazonCounterfactualClassification",
@@ -32,7 +34,7 @@ FAST_TASKS = [
     "LegalBenchPC",
     "AskUbuntuDupQuestions",
     "AILACasedocs",
-    "BIOSSES",
+    "STSBenchmark",
 ]
 
 
@@ -265,7 +267,9 @@ def run_eval(args):
     encoder = QwenEmbeddingEncoder(embedder, batch_size=args.batch_size)
 
     import mteb
-    if args.full:
+    if args.quick:
+        tasks = mteb.get_tasks(tasks=[QUICK_TASK])
+    elif args.full:
         text_types = ["BitextMining", "Classification", "Clustering", "InstructionRetrieval",
                        "MultilabelClassification", "PairClassification", "Reranking", "Retrieval", "STS"]
         tasks = mteb.get_tasks(task_types=text_types, languages=["eng"])
@@ -328,6 +332,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="results/mmteb")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--max_length", type=int, default=8192)
+    parser.add_argument("--quick", action="store_true", help="Run only STSBenchmark (fastest comparison)")
     parser.add_argument("--full", action="store_true", help="Run full MMTEB (all English tasks)")
     parser.add_argument("--tasks", nargs="+", default=None, help="Specific task names to run")
     args = parser.parse_args()

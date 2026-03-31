@@ -82,45 +82,57 @@ Key parameters:
 
 ## 5. Evaluation
 
-### Quick eval (single task, ~10 seconds):
+### Quick comparison on STSBenchmark (~20 seconds per model):
+
+This is the recommended first thing to run on a new machine. STSBenchmark is the canonical STS task (1,379 test pairs). The Qwen3-VL-Embedding-2B paper reports STS average of 74.29 on MMTEB.
+
 ```bash
-# Untrained base model
-python src/eval/run_mmteb.py --model_path models/Qwen3.5-0.8B \
-  --output_dir results/qwen35-base --tasks BIOSSES
+# 1. Baseline: Qwen3-VL-Embedding-2B (requires model download from step 2)
+CUDA_VISIBLE_DEVICES=0 python src/eval/run_mmteb.py \
+  --model_path models/Qwen3-VL-Embedding-2B \
+  --output_dir results/qwen3vl-2b-stsb --quick
 
-# LoRA checkpoint (auto-detects adapter_config.json)
-python src/eval/run_mmteb.py --model_path outputs/poc-v1/final \
-  --output_dir results/poc-v1 --tasks BIOSSES
+# 2. Our tuned model (requires training from step 4, or use a transferred checkpoint)
+CUDA_VISIBLE_DEVICES=0 python src/eval/run_mmteb.py \
+  --model_path outputs/poc-v1/final \
+  --output_dir results/poc-v1-stsb --quick
 
-# Qwen3-VL-Embedding-2B baseline (requires model download)
-python src/eval/run_mmteb.py --model_path models/Qwen3-VL-Embedding-2B \
-  --output_dir results/qwen3vl-2b --tasks BIOSSES
+# 3. Compare side-by-side
+python src/eval/compare_models.py \
+  --results_a results/qwen3vl-2b-stsb \
+  --results_b results/poc-v1-stsb
 ```
 
-### Fast MMTEB subset (9 tasks, one per type, ~30 min):
-```bash
-python src/eval/run_mmteb.py --model_path outputs/poc-v1/final \
-  --output_dir results/poc-v1-fast
-```
+### Other eval modes:
 
-### Full MMTEB (all English tasks, several hours):
 ```bash
-python src/eval/run_mmteb.py --model_path outputs/poc-v1/final \
-  --output_dir results/poc-v1-full --full
-```
+# Single specific task
+python src/eval/run_mmteb.py --model_path <path> --output_dir <dir> --tasks BIOSSES
 
-### Compare two models:
-```bash
-python src/eval/compare_models.py --results_a results/qwen3vl-2b --results_b results/poc-v1
+# Fast MMTEB subset (9 tasks, one per type, ~30 min)
+python src/eval/run_mmteb.py --model_path <path> --output_dir <dir>
+
+# Full MMTEB (all English tasks, several hours)
+python src/eval/run_mmteb.py --model_path <path> --output_dir <dir> --full
 ```
 
 ## 6. PoC Results (from original machine)
 
-| Model | BIOSSES STS |
-|-------|------------|
+### STSBenchmark (primary comparison metric):
+
+| Model | STSBenchmark | Notes |
+|-------|-------------|-------|
+| Qwen3.5-0.8B (untrained) | 18.20 | No embedding training |
+| Qwen3.5-0.8B (PoC, 2K samples) | **67.41** | LoRA, 1 epoch, 7 min on 4090 |
+| Qwen3-VL-Embedding-2B (reported avg STS) | 74.29 | Reported MMTEB STS average |
+| Qwen3-VL-Embedding-2B (STSBenchmark) | TBD | Run step 5 on faster machine |
+
+### BIOSSES (small biomedical STS, also validated):
+
+| Model | BIOSSES |
+|-------|---------|
 | Qwen3.5-0.8B (untrained) | 31.73 |
-| Qwen3.5-0.8B (PoC, 2K samples) | **76.84** |
-| Qwen3-VL-Embedding-2B (reported) | 74.29 |
+| Qwen3.5-0.8B (PoC, 2K samples) | 76.84 |
 
 Training log for 2K sample run:
 - Loss: 1.56 -> 0.25 over 62 steps
