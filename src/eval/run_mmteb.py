@@ -257,8 +257,25 @@ class QwenEmbeddingEncoder:
 
     @staticmethod
     def _instruction_for_task(task_metadata, prompt_type) -> str:
-        """Use MTEB task prompts when available (critical for STS)."""
+        """Match the official Qwen3-Embedding get_instruction logic.
+
+        Critical overrides (applied to BOTH query and document sides):
+          - STS / PairClassification → "Retrieve semantically similar text"
+          - BitextMining             → "Retrieve parallel sentences"
+          - Retrieval (doc side)     → "" (no instruction)
+        """
         from mteb.types import PromptType
+
+        task_type = getattr(task_metadata, "type", "") or ""
+
+        if task_type in ("STS", "PairClassification"):
+            return "Retrieve semantically similar text"
+
+        if task_type == "BitextMining":
+            return "Retrieve parallel sentences"
+
+        if "Retrieval" in task_type and prompt_type != PromptType.query:
+            return ""
 
         prompt_field = getattr(task_metadata, "prompt", None)
         if isinstance(prompt_field, str) and prompt_field.strip():
@@ -271,22 +288,17 @@ class QwenEmbeddingEncoder:
                 if passage:
                     return str(passage).strip()
 
-        task_type = getattr(task_metadata, "type", "") or ""
-        instruction = "Represent the user's input."
         if prompt_type == PromptType.query:
-            if "Retrieval" in task_type or "Retrieval" in task_metadata.name:
-                instruction = "Given a query, retrieve a relevant document that answers the query."
-            elif "Classification" in task_type:
-                instruction = "Classify the given text."
-            elif "Clustering" in task_type:
-                instruction = "Identify the topic or theme of the given text."
-            elif "PairClassification" in task_type:
-                instruction = "Retrieve a text that is semantically similar or related."
-            elif "Reranking" in task_type:
-                instruction = "Given a query, retrieve a relevant document."
-            elif "BitextMining" in task_type:
-                instruction = "Retrieve a translation of the given text."
-        return instruction
+            if "Retrieval" in task_type or "Retrieval" in getattr(task_metadata, "name", ""):
+                return "Given a query, retrieve a relevant document that answers the query."
+            if "Classification" in task_type:
+                return "Classify the given text."
+            if "Clustering" in task_type:
+                return "Identify the topic or theme of the given text."
+            if "Reranking" in task_type:
+                return "Given a query, retrieve a relevant document."
+
+        return "Represent the user's input."
 
     def encode(self, inputs: DataLoader, *, task_metadata, hf_split, hf_subset,
                prompt_type=None, **kwargs) -> np.ndarray:
@@ -345,10 +357,10 @@ def run_eval(args):
     logger.info(f"Detected model type: {model_type} for {args.model_path}")
 
     if args.batch_size is None:
-        batch_size = 8 if model_type == "qwen3vl" else 32
+        batch_size = 32
     else:
         batch_size = args.batch_size
-    logger.info("Encode batch_size=%s (OOM splits halve automatically)", batch_size)
+    logger.info("Encode batch_size=%s (CUDA OOM halves micro-batch until 1)", batch_size)
 
     if model_type == "qwen3vl":
         embedder = load_qwen3vl_embedder(args.model_path, max_length=args.max_length)
@@ -438,8 +450,8 @@ def run_eval(args):
         "per_task": per_task_scores,
         "eval_note": (
             "STS: AnySTSEvaluator (main_score typically cosine_spearman). "
-            "Paper-style: no asymmetric 'Retrieve semantically similar text.' override for STS; "
-            "default 'Represent the user's input.' unless task_metadata.prompt applies. "
+            "Paper-style: STS/PairClassification use symmetric 'Retrieve semantically similar text.' instruction; "
+            "Retrieval doc side uses empty instruction; BitextMining uses 'Retrieve parallel sentences.'. "
             "--sts runs all registered MMTEB task_types=STS (multilingual)."
         ),
     }
@@ -456,7 +468,7 @@ def main():
         "--batch_size",
         type=int,
         default=None,
-        help="Encoder micro-batch size (default: 8 for Qwen3-VL, 32 for Qwen3.5; halves on CUDA OOM)",
+        help="Encoder micro-batch size (default: 32; halves on CUDA OOM until chunk size 1)",
     )
     parser.add_argument("--max_length", type=int, default=8192)
     parser.add_argument("--quick", action="store_true", help="Run only STSBenchmark (fastest comparison)")
