@@ -22,3 +22,18 @@ build/
 
 .cache/
 *.incomplete
+
+# Local Python environments
+.venv/
+venv/
+env/
+
+# Tooling and test caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Editor/project-local files
+.vscode/
+.idea/
