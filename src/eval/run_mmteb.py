@@ -17,11 +17,23 @@ from typing import Any
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def attach_run_log(output_dir: Path) -> None:
+    """Write a run.log under output_dir mirroring all root-logger output."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / "run.log"
+    fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.getLogger().addHandler(fh)
+    logger.info("Logging to %s", log_path.resolve())
 
 QUICK_TASK = "STSBenchmark"
 
@@ -241,6 +253,30 @@ def load_qwen3vl_embedder(model_path: str, **kwargs):
     return _Qwen3VLEmbedder(model_path, max_length=kwargs.get("max_length", 8192))
 
 
+_TASK_PROMPTS: dict = None  # lazy-loaded from task_prompts.json
+
+
+def _load_task_prompts() -> dict:
+    global _TASK_PROMPTS
+    if _TASK_PROMPTS is None:
+        prompts_path = Path(__file__).resolve().parent / "task_prompts.json"
+        if prompts_path.exists():
+            with open(prompts_path) as f:
+                _TASK_PROMPTS = json.load(f)
+            logger.info("Loaded %d task prompts from %s", len(_TASK_PROMPTS), prompts_path)
+        else:
+            logger.warning("task_prompts.json not found at %s; using MTEB metadata only", prompts_path)
+            _TASK_PROMPTS = {}
+    return _TASK_PROMPTS
+
+
+def _encode_batch_size_for_task(task_name: str, default: int) -> int:
+    """Per-task encode micro-batch; keep defaults except known OOM-heavy tasks."""
+    if task_name in ("STS22", "STS22.v2"):
+        return 16
+    return default
+
+
 class QwenEmbeddingEncoder:
     """MTEB-compatible encoder wrapping either Qwen3.5 or Qwen3-VL embedders."""
 
@@ -257,16 +293,54 @@ class QwenEmbeddingEncoder:
 
     @staticmethod
     def _instruction_for_task(task_metadata, prompt_type) -> str:
-        """Match the official Qwen3-Embedding get_instruction logic.
+        """Mirror Qwen3-Embedding evaluation/qwen3_embedding_model.py:get_instruction.
 
-        Critical overrides (applied to BOTH query and document sides):
-          - STS / PairClassification → "Retrieve semantically similar text"
-          - BitextMining             → "Retrieve parallel sentences"
-          - Retrieval (doc side)     → "" (no instruction)
+        Priority (matching upstream exactly):
+          1. task_prompts.json lookup by task name (instruction_dict in Qwen's code).
+             Entries can be a string (used for both sides) or a dict with
+             "query"/"passage" keys (symmetric task).
+          2. MTEB task metadata prompt (super().get_instruction in Qwen's code).
+          3. Type-based hard overrides (always applied after step 1/2):
+             - Retrieval doc side  → "" (unless symmetric task from step 1)
+             - STS / PairClassification → "Retrieve semantically similar text"
+             - BitextMining        → "Retrieve parallel sentences"
+          4. Retrieval query fallback when nothing else matched →
+             "Retrieval relevant passage for the given query."
+          5. Whatever instruction was resolved (may be None/"" → embedder default).
         """
         from mteb.types import PromptType
+        import mteb as _mteb
 
+        task_name = getattr(task_metadata, "name", "")
         task_type = getattr(task_metadata, "type", "") or ""
+        prompts = _load_task_prompts()
+
+        # Step 1: task_prompts.json (Qwen instruction_dict)
+        instruction = None
+        sym_task = False
+        if task_name in prompts:
+            entry = prompts[task_name]
+            if isinstance(entry, dict):
+                pt_key = "query" if prompt_type == PromptType.query else "passage"
+                instruction = entry.get(pt_key, "")
+                sym_task = True
+            else:
+                instruction = str(entry)
+
+        # Step 2: fallback to MTEB task metadata (super().get_instruction)
+        if instruction is None:
+            prompt_field = getattr(task_metadata, "prompt", None)
+            if isinstance(prompt_field, str) and prompt_field.strip():
+                instruction = prompt_field.strip()
+            elif isinstance(prompt_field, dict):
+                pt_key = "query" if prompt_type == PromptType.query else "passage"
+                val = prompt_field.get(pt_key) or prompt_field.get("document")
+                if val:
+                    instruction = str(val).strip()
+
+        # Step 3: type-based overrides (always win, matching upstream)
+        if "Retrieval" in task_type and not sym_task and prompt_type != PromptType.query:
+            return ""
 
         if task_type in ("STS", "PairClassification"):
             return "Retrieve semantically similar text"
@@ -274,66 +348,62 @@ class QwenEmbeddingEncoder:
         if task_type == "BitextMining":
             return "Retrieve parallel sentences"
 
-        if "Retrieval" in task_type and prompt_type != PromptType.query:
-            return ""
+        # Step 4: retrieval query fallback
+        if "Retrieval" in task_type and prompt_type == PromptType.query and instruction is None:
+            return "Retrieval relevant passage for the given query."
 
-        prompt_field = getattr(task_metadata, "prompt", None)
-        if isinstance(prompt_field, str) and prompt_field.strip():
-            return prompt_field.strip()
-        if isinstance(prompt_field, dict):
-            if prompt_type == PromptType.query and prompt_field.get("query"):
-                return str(prompt_field["query"]).strip()
-            if prompt_type == PromptType.document:
-                passage = prompt_field.get("passage") or prompt_field.get("document")
-                if passage:
-                    return str(passage).strip()
-
-        if prompt_type == PromptType.query:
-            if "Retrieval" in task_type or "Retrieval" in getattr(task_metadata, "name", ""):
-                return "Given a query, retrieve a relevant document that answers the query."
-            if "Classification" in task_type:
-                return "Classify the given text."
-            if "Clustering" in task_type:
-                return "Identify the topic or theme of the given text."
-            if "Reranking" in task_type:
-                return "Given a query, retrieve a relevant document."
-
-        return "Represent the user's input."
+        return instruction or ""
 
     def encode(self, inputs: DataLoader, *, task_metadata, hf_split, hf_subset,
                prompt_type=None, **kwargs) -> np.ndarray:
+        show_progress_bar = kwargs.get("show_progress_bar", True)
+        micro_batch = int(kwargs.get("batch_size", self.batch_size))
+
         all_texts = [text for batch in inputs for text in batch["text"]]
 
         instruction = self._instruction_for_task(task_metadata, prompt_type)
 
         all_embeddings = []
         i, n = 0, len(all_texts)
-        while i < n:
-            chunk = min(self.batch_size, n - i)
-            while chunk >= 1:
-                batch_texts = all_texts[i : i + chunk]
-                items = [{"text": t, "instruction": instruction} for t in batch_texts]
-                try:
-                    with torch.no_grad():
-                        embs = self.embedder.process(items, normalize=True)
-                    all_embeddings.append(embs.cpu().float().numpy())
-                    i += chunk
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    break
-                except torch.cuda.OutOfMemoryError:
-                    if chunk <= 1:
-                        raise
-                    chunk = max(1, chunk // 2)
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    logger.warning(
-                        "CUDA OOM encoding %s (%s); retrying with chunk size %d (start index %d)",
-                        getattr(task_metadata, "name", "?"),
-                        hf_subset,
-                        chunk,
-                        i,
-                    )
+        task_label = getattr(task_metadata, "name", "?")
+        pbar = tqdm(
+            total=n,
+            desc=f"Encode {task_label}",
+            unit="seq",
+            disable=not show_progress_bar,
+            leave=False,
+            dynamic_ncols=True,
+        )
+        try:
+            while i < n:
+                chunk = min(micro_batch, n - i)
+                while chunk >= 1:
+                    batch_texts = all_texts[i : i + chunk]
+                    items = [{"text": t, "instruction": instruction} for t in batch_texts]
+                    try:
+                        with torch.no_grad():
+                            embs = self.embedder.process(items, normalize=True)
+                        all_embeddings.append(embs.cpu().float().numpy())
+                        i += chunk
+                        pbar.update(chunk)
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        break
+                    except torch.cuda.OutOfMemoryError:
+                        if chunk <= 1:
+                            raise
+                        chunk = max(1, chunk // 2)
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        logger.warning(
+                            "CUDA OOM encoding %s (%s); retrying with chunk size %d (start index %d)",
+                            task_label,
+                            hf_subset,
+                            chunk,
+                            i,
+                        )
+        finally:
+            pbar.close()
 
         return np.concatenate(all_embeddings, axis=0)
 
@@ -353,6 +423,9 @@ class QwenEmbeddingEncoder:
 
 
 def run_eval(args):
+    output_dir = Path(args.output_dir)
+    attach_run_log(output_dir)
+
     model_type = detect_model_type(args.model_path)
     logger.info(f"Detected model type: {model_type} for {args.model_path}")
 
@@ -386,17 +459,50 @@ def run_eval(args):
     else:
         tasks = mteb.get_tasks(tasks=FAST_TASKS)
 
+    tasks = list(tasks)
     logger.info(f"Running {len(tasks)} tasks")
 
-    output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    encode_kwargs = {"batch_size": batch_size}
-    results = mteb.evaluate(
-        encoder,
-        tasks,
-        overwrite_strategy="always",
-        encode_kwargs=encode_kwargs,
+    from mteb.results import ModelResult
+
+    task_results_acc: list = []
+    exceptions_acc: list | None = None
+    model_name: str | None = None
+    model_revision: str | None = None
+
+    tasks_bar = tqdm(tasks, desc="MMTEB tasks", dynamic_ncols=True)
+    for ti, task in enumerate(tasks_bar):
+        tname = task.metadata.name
+        task_bs = _encode_batch_size_for_task(tname, batch_size)
+        tasks_bar.set_postfix_str(tname[:40] + ("…" if len(tname) > 40 else ""))
+        logger.info(
+            "MMTEB task %d/%d: %s (encode batch_size=%s)",
+            ti + 1,
+            len(tasks),
+            tname,
+            task_bs,
+        )
+        encode_kwargs = {"batch_size": task_bs, "show_progress_bar": True}
+        _res = mteb.evaluate(
+            encoder,
+            task,
+            overwrite_strategy="always",
+            encode_kwargs=encode_kwargs,
+            show_progress_bar=False,
+        )
+        task_results_acc.extend(_res.task_results)
+        if _res.exceptions:
+            exceptions_acc = (exceptions_acc or []) + list(_res.exceptions)
+        if model_name is None:
+            model_name = _res.model_name
+            model_revision = _res.model_revision
+
+    results = ModelResult(
+        model_name=model_name or "unknown",
+        model_revision=model_revision,
+        task_results=task_results_acc,
+        exceptions=exceptions_acc,
     )
 
     scores_by_type = {}
@@ -443,6 +549,7 @@ def run_eval(args):
         "model_path": args.model_path,
         "model_type": model_type,
         "batch_size": batch_size,
+        "encode_batch_size_overrides": {"STS22": 16, "STS22.v2": 16},
         "num_tasks": len(per_task_scores),
         "mean_task": float(np.mean(all_scores) * 100) if all_scores else 0,
         "mean_type": float(np.mean([np.mean(v) for v in scores_by_type.values()]) * 100) if scores_by_type else 0,
