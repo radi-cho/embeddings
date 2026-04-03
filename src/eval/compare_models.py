@@ -39,12 +39,29 @@ def run_eval_if_needed(model_path: str, output_dir: str, fast_tasks_only: bool =
 def print_comparison(summary_a: dict, summary_b: dict):
     name_a = summary_a.get("model_path", "Model A")
     name_b = summary_b.get("model_path", "Model B")
+
+    tasks_a = summary_a.get("per_task", {})
+    tasks_b = summary_b.get("per_task", {})
+    all_task_names = sorted(set(list(tasks_a.keys()) + list(tasks_b.keys())))
+
+    col_w = max(len(name_a), len(name_b), 12) + 2
+
+    if all_task_names:
+        print(f"\n{'Task':<35s} {name_a:>{col_w}s} {name_b:>{col_w}s} {'Delta':>8s}")
+        print("-" * (35 + col_w * 2 + 10))
+        for tn in all_task_names:
+            sa = tasks_a.get(tn, {}).get("score", 0)
+            sb = tasks_b.get(tn, {}).get("score", 0)
+            delta = sb - sa
+            sign = "+" if delta > 0 else ""
+            print(f"  {tn:<33s} {sa:>{col_w}.2f} {sb:>{col_w}.2f} {sign}{delta:>7.2f}")
+        print()
+
     types_a = summary_a.get("per_type", {})
     types_b = summary_b.get("per_type", {})
     all_types = sorted(set(list(types_a.keys()) + list(types_b.keys())))
 
-    col_w = max(len(name_a), len(name_b), 12) + 2
-    print(f"\n{'Task Type':<35s} {name_a:>{col_w}s} {name_b:>{col_w}s} {'Delta':>8s}")
+    print(f"{'Type average':<35s} {name_a:>{col_w}s} {name_b:>{col_w}s} {'Delta':>8s}")
     print("-" * (35 + col_w * 2 + 10))
 
     for tt in all_types:
@@ -62,7 +79,7 @@ def print_comparison(summary_a: dict, summary_b: dict):
     print("-" * (35 + col_w * 2 + 10))
     d1 = mean_task_b - mean_task_a
     d2 = mean_type_b - mean_type_a
-    print(f"  {'Mean (Task)':<33s} {mean_task_a:>{col_w}.2f} {mean_task_b:>{col_w}.2f} {'+'if d1>0 else ''}{d1:>7.2f}")
+    print(f"  {'Mean (all subset scores)':<33s} {mean_task_a:>{col_w}.2f} {mean_task_b:>{col_w}.2f} {'+'if d1>0 else ''}{d1:>7.2f}")
     print(f"  {'Mean (Type)':<33s} {mean_type_a:>{col_w}.2f} {mean_type_b:>{col_w}.2f} {'+'if d2>0 else ''}{d2:>7.2f}")
 
 

@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 QUICK_TASK = "STSBenchmark"
 
+# Paper-style STS: `--sts` uses `get_tasks(task_types=["STS"])` (full multilingual MMTEB STS suite).
+# For English-only or harness-specific subsets, use `--benchmark MTEB(eng, v2)` or `--tasks BIOSSES ...`.
+
 FAST_TASKS = [
     "BUCC.v2",
     "AmazonCounterfactualClassification",
@@ -100,6 +103,11 @@ def load_qwen3vl_embedder(model_path: str, **kwargs):
     except ImportError:
         raise ImportError("Qwen3-VL model classes not available in this transformers version")
 
+    try:
+        from qwen_vl_utils.vision_process import process_vision_info
+    except ImportError:
+        process_vision_info = None
+
     from dataclasses import dataclass
     from transformers.modeling_outputs import ModelOutput
     from transformers.cache_utils import Cache
@@ -152,44 +160,80 @@ def load_qwen3vl_embedder(model_path: str, **kwargs):
             self.processor = Qwen3VLProcessor.from_pretrained(model_name_or_path, padding_side="right")
             self.model.eval()
 
-        def process(self, inputs, normalize=True):
-            conversations = []
-            for ele in inputs:
-                instruction = ele.get("instruction", self.default_instruction)
-                if instruction:
-                    instruction = instruction.strip()
-                    if instruction and not unicodedata.category(instruction[-1]).startswith("P"):
-                        instruction += "."
-                content = []
-                text = ele.get("text")
-                if text:
-                    content.append({"type": "text", "text": text})
-                if not content:
-                    content.append({"type": "text", "text": "NULL"})
-                conv = [
-                    {"role": "system", "content": [{"type": "text", "text": instruction}]},
-                    {"role": "user", "content": content},
-                ]
-                conversations.append(conv)
+        @staticmethod
+        def _pool_last(hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+            flipped = attention_mask.flip(dims=[1])
+            last_pos = flipped.argmax(dim=1)
+            col = attention_mask.shape[1] - last_pos - 1
+            row = torch.arange(hidden_state.shape[0], device=hidden_state.device)
+            return hidden_state[row, col]
 
-            texts = self.processor.apply_chat_template(conversations, add_generation_prompt=True, tokenize=False)
-            if isinstance(texts, str):
-                texts = [texts]
-            processed = self.processor(
-                text=texts, truncation=True, max_length=self.max_length,
-                padding=True, return_tensors="pt",
+        def _format_turn(self, ele) -> list:
+            instruction = ele.get("instruction", self.default_instruction)
+            if instruction:
+                instruction = instruction.strip()
+                if instruction and not unicodedata.category(instruction[-1]).startswith("P"):
+                    instruction += "."
+            content = []
+            text = ele.get("text")
+            if text:
+                content.append({"type": "text", "text": text})
+            if not content:
+                content.append({"type": "text", "text": "NULL"})
+            return [
+                {"role": "system", "content": [{"type": "text", "text": instruction}]},
+                {"role": "user", "content": content},
+            ]
+
+        def process(self, inputs, normalize=True):
+            # Match HF `scripts/qwen3_vl_embedding.py`: chat template + optional vision preprocessing.
+            conversations = [self._format_turn(ele) for ele in inputs]
+            text = self.processor.apply_chat_template(
+                conversations, add_generation_prompt=True, tokenize=False,
             )
+            if isinstance(text, str):
+                text = [text]
+
+            if process_vision_info is not None:
+                try:
+                    images, video_inputs, video_kwargs = process_vision_info(
+                        conversations, image_patch_size=16,
+                        return_video_metadata=True, return_video_kwargs=True,
+                    )
+                except Exception as e:
+                    logger.warning("process_vision_info failed (%s); falling back to text-only processor path", e)
+                    images, video_inputs, video_kwargs = None, None, {"do_sample_frames": False}
+                if video_inputs is not None:
+                    videos, video_metadata = zip(*video_inputs)
+                    videos, video_metadata = list(videos), list(video_metadata)
+                else:
+                    videos, video_metadata = None, None
+                processed = self.processor(
+                    text=text,
+                    images=images,
+                    videos=videos,
+                    video_metadata=video_metadata,
+                    truncation=True,
+                    max_length=self.max_length,
+                    padding=True,
+                    do_resize=False,
+                    return_tensors="pt",
+                    **video_kwargs,
+                )
+            else:
+                processed = self.processor(
+                    text=text, truncation=True, max_length=self.max_length,
+                    padding=True, return_tensors="pt",
+                )
             processed = {k: v.to(self.model.device) for k, v in processed.items()}
             with torch.no_grad():
                 outputs = self.model(**processed)
 
             hidden = outputs.last_hidden_state
-            mask = outputs.attention_mask
-            flipped = mask.flip(dims=[1])
-            last_pos = flipped.argmax(dim=1)
-            col = mask.shape[1] - last_pos - 1
-            row = torch.arange(hidden.shape[0], device=hidden.device)
-            embs = hidden[row, col]
+            mask = processed.get("attention_mask")
+            if mask is None:
+                raise RuntimeError("Qwen3-VL embedding forward missing attention_mask")
+            embs = self._pool_last(hidden, mask)
             if normalize:
                 embs = F.normalize(embs, p=2, dim=-1)
             return embs
@@ -204,39 +248,80 @@ class QwenEmbeddingEncoder:
         self.embedder = embedder
         self.batch_size = batch_size
         from mteb.models.model_meta import ModelMeta
-        self.mteb_model_meta = ModelMeta.create_empty()
-        self.mteb_model_meta.name = model_name
+        meta = ModelMeta.create_empty()
+        try:
+            self.mteb_model_meta = meta.model_copy(update={"name": model_name})
+        except AttributeError:
+            meta.name = model_name
+            self.mteb_model_meta = meta
 
-    def encode(self, inputs: DataLoader, *, task_metadata, hf_split, hf_subset,
-               prompt_type=None, **kwargs) -> np.ndarray:
-        all_texts = [text for batch in inputs for text in batch["text"]]
-
-        instruction = "Represent the user's input."
+    @staticmethod
+    def _instruction_for_task(task_metadata, prompt_type) -> str:
+        """Use MTEB task prompts when available (critical for STS)."""
         from mteb.types import PromptType
+
+        prompt_field = getattr(task_metadata, "prompt", None)
+        if isinstance(prompt_field, str) and prompt_field.strip():
+            return prompt_field.strip()
+        if isinstance(prompt_field, dict):
+            if prompt_type == PromptType.query and prompt_field.get("query"):
+                return str(prompt_field["query"]).strip()
+            if prompt_type == PromptType.document:
+                passage = prompt_field.get("passage") or prompt_field.get("document")
+                if passage:
+                    return str(passage).strip()
+
+        task_type = getattr(task_metadata, "type", "") or ""
+        instruction = "Represent the user's input."
         if prompt_type == PromptType.query:
-            task_type = task_metadata.type if hasattr(task_metadata, "type") else ""
             if "Retrieval" in task_type or "Retrieval" in task_metadata.name:
                 instruction = "Given a query, retrieve a relevant document that answers the query."
             elif "Classification" in task_type:
                 instruction = "Classify the given text."
             elif "Clustering" in task_type:
                 instruction = "Identify the topic or theme of the given text."
-            elif "STS" in task_type or "STS" in task_metadata.name:
-                instruction = "Retrieve a semantically similar text."
             elif "PairClassification" in task_type:
                 instruction = "Retrieve a text that is semantically similar or related."
             elif "Reranking" in task_type:
                 instruction = "Given a query, retrieve a relevant document."
             elif "BitextMining" in task_type:
                 instruction = "Retrieve a translation of the given text."
+        return instruction
+
+    def encode(self, inputs: DataLoader, *, task_metadata, hf_split, hf_subset,
+               prompt_type=None, **kwargs) -> np.ndarray:
+        all_texts = [text for batch in inputs for text in batch["text"]]
+
+        instruction = self._instruction_for_task(task_metadata, prompt_type)
 
         all_embeddings = []
-        for i in range(0, len(all_texts), self.batch_size):
-            batch_texts = all_texts[i:i + self.batch_size]
-            items = [{"text": t, "instruction": instruction} for t in batch_texts]
-            with torch.no_grad():
-                embs = self.embedder.process(items, normalize=True)
-            all_embeddings.append(embs.cpu().float().numpy())
+        i, n = 0, len(all_texts)
+        while i < n:
+            chunk = min(self.batch_size, n - i)
+            while chunk >= 1:
+                batch_texts = all_texts[i : i + chunk]
+                items = [{"text": t, "instruction": instruction} for t in batch_texts]
+                try:
+                    with torch.no_grad():
+                        embs = self.embedder.process(items, normalize=True)
+                    all_embeddings.append(embs.cpu().float().numpy())
+                    i += chunk
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    if chunk <= 1:
+                        raise
+                    chunk = max(1, chunk // 2)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    logger.warning(
+                        "CUDA OOM encoding %s (%s); retrying with chunk size %d (start index %d)",
+                        getattr(task_metadata, "name", "?"),
+                        hf_subset,
+                        chunk,
+                        i,
+                    )
 
         return np.concatenate(all_embeddings, axis=0)
 
@@ -259,16 +344,27 @@ def run_eval(args):
     model_type = detect_model_type(args.model_path)
     logger.info(f"Detected model type: {model_type} for {args.model_path}")
 
+    if args.batch_size is None:
+        batch_size = 8 if model_type == "qwen3vl" else 32
+    else:
+        batch_size = args.batch_size
+    logger.info("Encode batch_size=%s (OOM splits halve automatically)", batch_size)
+
     if model_type == "qwen3vl":
         embedder = load_qwen3vl_embedder(args.model_path, max_length=args.max_length)
     else:
         embedder = load_qwen35_embedder(args.model_path, max_length=args.max_length)
 
-    encoder = QwenEmbeddingEncoder(embedder, batch_size=args.batch_size)
+    encoder = QwenEmbeddingEncoder(embedder, batch_size=batch_size)
 
     import mteb
     if args.quick:
         tasks = mteb.get_tasks(tasks=[QUICK_TASK])
+    elif args.sts:
+        tasks = mteb.get_tasks(task_types=["STS"])
+    elif args.benchmark:
+        bench = mteb.get_benchmark(args.benchmark)
+        tasks = list(bench.tasks)
     elif args.full:
         text_types = ["BitextMining", "Classification", "Clustering", "InstructionRetrieval",
                        "MultilabelClassification", "PairClassification", "Reranking", "Retrieval", "STS"]
@@ -283,31 +379,49 @@ def run_eval(args):
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    encode_kwargs = {"batch_size": batch_size}
     results = mteb.evaluate(
         encoder,
         tasks,
         overwrite_strategy="always",
+        encode_kwargs=encode_kwargs,
     )
 
     scores_by_type = {}
+    per_task_scores = {}
     all_scores = []
-    for task_result in results:
+    for task_result in results.task_results:
+        task_name = task_result.task.metadata.name
+        task_type = task_result.task.metadata.type
+        task_means = []
         for split_results in task_result.scores.values():
             for score_dict in split_results:
                 main_score = score_dict.get("main_score", None)
                 if main_score is not None:
-                    task_type = task_result.task.metadata.type
                     scores_by_type.setdefault(task_type, []).append(main_score)
                     all_scores.append(main_score)
+                    task_means.append(main_score)
+        if task_means:
+            per_task_scores[task_name] = {
+                "type": task_type,
+                "score": float(np.mean(task_means) * 100),
+                "num_subsets": len(task_means),
+            }
 
     print("\n" + "=" * 60)
     print(f"MMTEB Results for: {args.model_path}")
     print("=" * 60)
+    if per_task_scores:
+        print("\n  Per-task (mean over hf subsets run)")
+        for tn in sorted(per_task_scores):
+            row = per_task_scores[tn]
+            print(f"    {tn:40s}: {row['score']:6.2f}  ({row['num_subsets']} subsets, {row['type']})")
+        print()
     for tt in sorted(scores_by_type):
         scores = scores_by_type[tt]
-        print(f"  {tt:35s}: {np.mean(scores)*100:.2f} ({len(scores)} tasks)")
+        print(f"  {tt:35s}: {np.mean(scores)*100:.2f} ({len(scores)} subset scores)")
     if all_scores:
-        print(f"  {'Mean (Task)':35s}: {np.mean(all_scores)*100:.2f}")
+        print(f"  {'Mean (all subset scores)':35s}: {np.mean(all_scores)*100:.2f}")
     if scores_by_type:
         type_means = [np.mean(v) for v in scores_by_type.values()]
         print(f"  {'Mean (Type)':35s}: {np.mean(type_means)*100:.2f}")
@@ -316,10 +430,18 @@ def run_eval(args):
     summary = {
         "model_path": args.model_path,
         "model_type": model_type,
-        "num_tasks": len(all_scores),
+        "batch_size": batch_size,
+        "num_tasks": len(per_task_scores),
         "mean_task": float(np.mean(all_scores) * 100) if all_scores else 0,
         "mean_type": float(np.mean([np.mean(v) for v in scores_by_type.values()]) * 100) if scores_by_type else 0,
         "per_type": {k: float(np.mean(v) * 100) for k, v in scores_by_type.items()},
+        "per_task": per_task_scores,
+        "eval_note": (
+            "STS: AnySTSEvaluator (main_score typically cosine_spearman). "
+            "Paper-style: no asymmetric 'Retrieve semantically similar text.' override for STS; "
+            "default 'Represent the user's input.' unless task_metadata.prompt applies. "
+            "--sts runs all registered MMTEB task_types=STS (multilingual)."
+        ),
     }
     with open(output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
@@ -330,9 +452,25 @@ def main():
     parser = argparse.ArgumentParser(description="MMTEB evaluation for Qwen embedding models")
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="results/mmteb")
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="Encoder micro-batch size (default: 8 for Qwen3-VL, 32 for Qwen3.5; halves on CUDA OOM)",
+    )
     parser.add_argument("--max_length", type=int, default=8192)
     parser.add_argument("--quick", action="store_true", help="Run only STSBenchmark (fastest comparison)")
+    parser.add_argument(
+        "--sts",
+        action="store_true",
+        help="Run all MMTEB STS tasks (multilingual; paper-style instruction, not English-only list)",
+    )
+    parser.add_argument(
+        "--benchmark",
+        type=str,
+        default=None,
+        help="Official MTEB benchmark name, e.g. MTEB(eng, v2) (applies subset filters like hf_subsets on tasks)",
+    )
     parser.add_argument("--full", action="store_true", help="Run full MMTEB (all English tasks)")
     parser.add_argument("--tasks", nargs="+", default=None, help="Specific task names to run")
     args = parser.parse_args()

@@ -9,7 +9,11 @@ The project uses an existing virtualenv. On the original machine this was `/medi
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
+```
 
+Hugging Face and MTEB use their default cache directories (typically under `~/.cache/`) unless you set `HF_HOME`, `HF_DATASETS_CACHE`, or `MTEB_CACHE`. A repo-local `.cache/` is gitignored if you prefer caches inside the project.
+
+```bash
 # Transformers must be installed from source (Qwen3.5 support not yet in a release)
 pip install "transformers @ git+https://github.com/huggingface/transformers.git@main"
 
