@@ -54,15 +54,31 @@ FAST_TASKS = [
 
 
 def detect_model_type(model_path: str) -> str:
+    """Classify checkpoint for MTEB embedder choice (Hub id or local path).
+
+    Uses local config.json when present; otherwise `AutoConfig.from_pretrained` so Hub
+    models are detected without relying on name substrings alone.
+    """
     config_path = Path(model_path) / "config.json"
-    if config_path.exists():
+    model_type = ""
+    if config_path.is_file():
         with open(config_path) as f:
-            cfg = json.load(f)
-        model_type = cfg.get("model_type", "")
-        if "qwen3_5" in model_type:
-            return "qwen3.5"
-        if "qwen3_vl" in model_type:
-            return "qwen3vl"
+            model_type = json.load(f).get("model_type", "")
+    else:
+        try:
+            from transformers import AutoConfig
+
+            cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+            model_type = getattr(cfg, "model_type", "") or ""
+        except Exception:
+            model_type = ""
+
+    mt = model_type.lower()
+    if "qwen3_5" in mt or "qwen3.5" in mt:
+        return "qwen3.5"
+    if "qwen3_vl" in mt:
+        return "qwen3vl"
+
     if "Qwen3-VL" in model_path or "qwen3-vl" in model_path.lower():
         return "qwen3vl"
     if "Qwen3.5" in model_path or "qwen3_5" in model_path.lower() or "qwen3.5" in model_path.lower():

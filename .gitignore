@@ -19,6 +19,8 @@ datasets/mmeb_cache/
 *.ckpt
 
 .env
+.hf_token_local
+*.pid
 *.log
 
 .cache/

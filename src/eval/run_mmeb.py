@@ -32,6 +32,7 @@ Usage:
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import sys
@@ -47,6 +48,46 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _atomic_write_json(path: Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+    tmp.replace(path)
+
+
+def _mmeb_summary_dict(results: list, args, model_type: str) -> dict:
+    valid = [r for r in results if r.get("hit_at_1") is not None]
+    per_cat = {}
+    for r in valid:
+        per_cat.setdefault(r["category"], []).append(r["hit_at_1"])
+    return {
+        "model_path": args.model_path,
+        "model_type": model_type,
+        "num_tasks": len(valid),
+        "num_tasks_completed": len(results),
+        "num_tasks_scored": len(valid),
+        "mean_hit_at_1": round(float(np.mean([r["hit_at_1"] for r in valid])), 2) if valid else None,
+        "per_category": {
+            cat: {"mean": round(float(np.mean(scores)), 2), "num_tasks": len(scores)}
+            for cat, scores in per_cat.items()
+        },
+        "tasks": results,
+        "eval_settings": {
+            "max_length": args.max_length,
+            "image_min_pixels": args.image_min_pixels or MMEB_IMAGE_MIN_PIXELS,
+            "image_max_pixels": args.image_max_pixels or MMEB_IMAGE_MAX_PIXELS,
+            "test_instructions_repo": args.test_instructions_repo,
+            "mmeb_v2_media_repo": MMEB_V2_MEDIA_REPO,
+            "mmeb_v2_image_tar": MMEB_V2_IMAGE_TAR,
+            "note": (
+                "36 image tasks: annotations from test_instructions_repo; "
+                "pixels from MMEB-V2 mmeb_v1 tarball when using --download_images."
+            ),
+        },
+    }
 
 
 def attach_run_log(output_dir: Path) -> None:
@@ -211,15 +252,49 @@ def load_model(
     if config_path.exists():
         with open(config_path) as f:
             model_type = json.load(f).get("model_type", "")
+    if not model_type:
+        try:
+            from transformers import AutoConfig
+
+            cfg = AutoConfig.from_pretrained(str(model_path), trust_remote_code=True)
+            model_type = getattr(cfg, "model_type", "") or ""
+        except Exception as e:
+            logger.debug("Could not load remote config for %s: %s", model_path, e)
+
+    path_str = str(model_path)
+    is_qwen3_vl = "qwen3_vl" in model_type.lower()
+    if not is_qwen3_vl and ("Qwen3-VL" in path_str or "qwen3-vl" in path_str.lower()):
+        is_qwen3_vl = True
 
     mip = MMEB_IMAGE_MIN_PIXELS if image_min_pixels is None else image_min_pixels
     mp = MMEB_IMAGE_MAX_PIXELS if image_max_pixels is None else image_max_pixels
 
-    if "qwen3_vl" in model_type:
-        scripts_dir = Path(model_path) / "scripts"
-        if scripts_dir.exists():
-            sys.path.insert(0, str(scripts_dir))
-        from qwen3_vl_embedding import Qwen3VLEmbedder
+    if is_qwen3_vl:
+        mp_local = Path(model_path)
+        local_script = mp_local / "scripts" / "qwen3_vl_embedding.py"
+        vendor_script = (
+            Path(__file__).resolve().parents[2]
+            / "Qwen3-VL-Embedding"
+            / "src"
+            / "models"
+            / "qwen3_vl_embedding.py"
+        )
+        if local_script.is_file():
+            sys.path.insert(0, str(mp_local / "scripts"))
+            from qwen3_vl_embedding import Qwen3VLEmbedder
+        elif vendor_script.is_file():
+            _vn = "_qwen3_vl_embedding_vendor"
+            spec = importlib.util.spec_from_file_location(_vn, vendor_script)
+            _mod = importlib.util.module_from_spec(spec)
+            assert spec.loader is not None
+            sys.modules[_vn] = _mod
+            spec.loader.exec_module(_mod)
+            Qwen3VLEmbedder = _mod.Qwen3VLEmbedder
+        else:
+            raise ImportError(
+                "Qwen3-VL MMEB needs scripts/qwen3_vl_embedding.py under the model path, "
+                f"or the vendor file at {vendor_script}"
+            )
 
         class _MMEBQwen3VLEmbedder(Qwen3VLEmbedder):
             """Applies optional per-item min/max_pixels from MMEB `make_item` (upstream ignores these keys)."""
@@ -572,7 +647,9 @@ def main():
         image_max_pixels=args.image_max_pixels,
     )
 
-    # Evaluate
+    # Evaluate (refresh summary.json after each task for crash-safe partial results)
+    out = Path(args.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
     results = []
     for task_name in tasks:
         try:
@@ -594,42 +671,12 @@ def main():
                 "hit_at_1": None,
                 "error": str(e),
             })
+        _atomic_write_json(
+            out / "summary.json",
+            _mmeb_summary_dict(results, args, model_type),
+        )
 
-    # Summarise
-    valid = [r for r in results if r.get("hit_at_1") is not None]
-    per_cat = {}
-    for r in valid:
-        per_cat.setdefault(r["category"], []).append(r["hit_at_1"])
-
-    summary = {
-        "model_path": args.model_path,
-        "model_type": model_type,
-        "num_tasks": len(valid),
-        "mean_hit_at_1": round(float(np.mean([r["hit_at_1"] for r in valid])), 2) if valid else None,
-        "per_category": {
-            cat: {"mean": round(float(np.mean(scores)), 2), "num_tasks": len(scores)}
-            for cat, scores in per_cat.items()
-        },
-        "tasks": results,
-        "eval_settings": {
-            "max_length": args.max_length,
-            "image_min_pixels": args.image_min_pixels or MMEB_IMAGE_MIN_PIXELS,
-            "image_max_pixels": args.image_max_pixels or MMEB_IMAGE_MAX_PIXELS,
-            "test_instructions_repo": args.test_instructions_repo,
-            "mmeb_v2_media_repo": MMEB_V2_MEDIA_REPO,
-            "mmeb_v2_image_tar": MMEB_V2_IMAGE_TAR,
-            "note": (
-                "36 image tasks: annotations from test_instructions_repo; "
-                "pixels from MMEB-V2 mmeb_v1 tarball when using --download_images."
-            ),
-        },
-    }
-
-    # Save
-    out = Path(args.output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    with open(out / "summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
+    summary = _mmeb_summary_dict(results, args, model_type)
 
     # Print table grouped by category, matching MMEB-V2 leaderboard style
     print()
@@ -677,6 +724,7 @@ def main():
     # Overall summary
     print()
     print("=" * 65)
+    valid = [r for r in results if r.get("hit_at_1") is not None]
     if valid:
         # Per-category means in one line (like the leaderboard)
         cat_means = {}
@@ -694,7 +742,9 @@ def main():
         }
         parts = [f"{cat_abbrev.get(c, c)}: {v:.1f}" for c, v in cat_means.items()]
         print(f"  {' | '.join(parts)}")
-        print(f"  Image Overall: {summary['mean_hit_at_1']:.2f}")
+        mh = summary["mean_hit_at_1"]
+        if mh is not None:
+            print(f"  Image Overall: {mh:.2f}")
     print("=" * 65)
     print(f"\n  Results saved to {args.output_dir}/")
 

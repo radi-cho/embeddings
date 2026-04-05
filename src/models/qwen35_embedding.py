@@ -251,10 +251,12 @@ class Qwen35Embedder:
             else:
                 videos_list, video_metadata = None, None
 
+            # Batched examples often have different raw resolutions; do_resize=False breaks
+            # Qwen2-VL-style patch packing (invalid .view in image_processor).
             inputs = self.processor(
                 text=texts, images=images, videos=videos_list, video_metadata=video_metadata,
                 truncation=True, max_length=self.max_length, padding=True,
-                do_resize=False, return_tensors="pt", **video_kwargs,
+                do_resize=True, return_tensors="pt", **video_kwargs,
             )
         else:
             inputs = tok(
