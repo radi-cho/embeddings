@@ -11,6 +11,7 @@ build/
 /outputs/
 /results/
 /datasets/poc_data/
+/datasets/mmeb_train_images/
 datasets/mmeb_cache/
 
 *.safetensors
@@ -20,6 +21,7 @@ datasets/mmeb_cache/
 
 .env
 .hf_token_local
+.hf_cache/
 *.pid
 *.log
 
@@ -40,3 +42,5 @@ env/
 # Editor/project-local files
 .vscode/
 .idea/
+
+wandb/
