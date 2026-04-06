@@ -38,6 +38,7 @@ EPOCHS="${EPOCHS:-3}"
 LR="${LR:-1e-4}"
 TEMPERATURE="${TEMPERATURE:-0.02}"
 MAX_LENGTH="${MAX_LENGTH:-512}"
+MAX_PIXELS="${MAX_PIXELS:-401408}"
 TRAINING_STAGE="${TRAINING_STAGE:-1}"
 MRL_DIMS="${MRL_DIMS:-1024,768,512,256,128,64}"
 LORA_RANK="${LORA_RANK:-32}"
@@ -69,6 +70,7 @@ echo "  Effective batch: $((BATCH_SIZE * GRAD_ACCUM * NUM_GPUS))"
 echo "  Epochs:         ${EPOCHS}"
 echo "  LR:             ${LR}"
 echo "  Temperature:    ${TEMPERATURE}"
+echo "  Max pixels:     ${MAX_PIXELS}"
 echo "  MRL dims:       ${MRL_DIMS}"
 echo "  LoRA:           rank=${LORA_RANK}, alpha=${LORA_ALPHA}"
 echo "  Stage:          ${TRAINING_STAGE}"
@@ -93,15 +95,18 @@ fi
 if [ -n "${MAX_SAMPLES}" ]; then
     EXTRA_ARGS="${EXTRA_ARGS} --max_samples_per_subset ${MAX_SAMPLES}"
 fi
-if [ "${USE_WANDB}" = "true" ]; then
-    EXTRA_ARGS="${EXTRA_ARGS} --use_wandb --wandb_project ${WANDB_PROJECT}"
-    if [ -n "${WANDB_ENTITY}" ]; then
+if [ -n "${NUM_WORKERS}" ]; then
+    EXTRA_ARGS="${EXTRA_ARGS} --num_workers ${NUM_WORKERS}"
+fi
         EXTRA_ARGS="${EXTRA_ARGS} --wandb_entity ${WANDB_ENTITY}"
     fi
     if [ -n "${WANDB_RUN_NAME}" ]; then
         EXTRA_ARGS="${EXTRA_ARGS} --wandb_run_name ${WANDB_RUN_NAME}"
     fi
 fi
+
+# Increase NCCL timeout for vision batches with variable sequence lengths
+export NCCL_TIMEOUT=1800000
 
 ACCELERATE="${PYTHON} -m accelerate.commands.accelerate_cli"
 
@@ -118,6 +123,7 @@ if [ "${NUM_GPUS}" -gt 1 ]; then
         --lr "${LR}" \
         --temperature "${TEMPERATURE}" \
         --max_length "${MAX_LENGTH}" \
+        --max_pixels "${MAX_PIXELS}" \
         --training_stage "${TRAINING_STAGE}" \
         --use_mrl \
         --mrl_dims "${MRL_DIMS}" \
@@ -138,6 +144,7 @@ else
         --lr "${LR}" \
         --temperature "${TEMPERATURE}" \
         --max_length "${MAX_LENGTH}" \
+        --max_pixels "${MAX_PIXELS}" \
         --training_stage "${TRAINING_STAGE}" \
         --use_mrl \
         --mrl_dims "${MRL_DIMS}" \

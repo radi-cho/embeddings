@@ -255,8 +255,7 @@ class Qwen35Embedder:
             # Qwen2-VL-style patch packing (invalid .view in image_processor).
             inputs = self.processor(
                 text=texts, images=images, videos=videos_list, video_metadata=video_metadata,
-                truncation=True, max_length=self.max_length, padding=True,
-                do_resize=True, return_tensors="pt", **video_kwargs,
+                padding=True, do_resize=True, return_tensors="pt", **video_kwargs,
             )
         else:
             inputs = tok(

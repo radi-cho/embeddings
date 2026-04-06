@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+export CUDA_DEVICES=0,1
+export USE_WANDB=true
+export WANDB_PROJECT=embeddings
+export WANDB_ENTITY=radi-and-people
+export WANDB_RUN_NAME=qwen35-0.8b-mmeb-stage1-fast
+export IMAGE_DIR=/home/jupyter/shared/embeddings/datasets/mmeb_train_images/images
+export OUTPUT_DIR=/home/jupyter/shared/embeddings/outputs/qwen35-0.8b-mmeb-stage1
+export MODEL_PATH=/home/jupyter/shared/embeddings/models/Qwen3.5-0.8B
+export BATCH_SIZE=32
+export GRAD_ACCUM=2
+export EPOCHS=3
+export LR=1e-4
+export MAX_LENGTH=512
+export MAX_PIXELS=401408
+export SAVE_STEPS=200
+export LOG_INTERVAL=1
+export NUM_WORKERS=4
+cd /home/jupyter/shared/embeddings
+exec bash scripts/run_training.sh

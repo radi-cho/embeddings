@@ -11,7 +11,6 @@ Loads the TIGER-Lab/MMEB-train dataset from Hugging Face, supporting:
 
 import logging
 import os
-import random
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -51,9 +50,6 @@ def _load_image_from_path(path: str, image_dir: Optional[str] = None) -> Optiona
         return None
 
     if image_dir:
-        # HF paths are "images/{subset}/Train/{filename}.jpg".
-        # With --image_dir pointing to the extracted images/ directory,
-        # join directly: "{image_dir}/{subset}/Train/{filename}.jpg"
         full = os.path.join(image_dir, path.replace("images/", "", 1) if path.startswith("images/") else path)
         if os.path.exists(full):
             try:
@@ -76,7 +72,7 @@ def _load_image_from_path(path: str, image_dir: Optional[str] = None) -> Optiona
 class MMEBDataset(Dataset):
     """
     Wraps a single MMEB-train subset. Each item yields a dict with:
-      - query: dict with keys text, image (PIL or None), instruction
+      - query: dict with keys text, image (PIL or None)
       - positive: dict with keys text, image (PIL or None)
       - negative: dict with keys text, image (PIL or None) or None
       - task_type: str (classification, vqa, retrieval)
@@ -136,17 +132,14 @@ class MMEBDataset(Dataset):
         if has_neg and neg_image_path:
             neg_image = _load_image_from_path(neg_image_path, self.image_dir)
 
-        # Strip image placeholder from text when image was successfully loaded
-        # (the model's processor injects vision tokens itself).
-        # When image failed to load, also strip the placeholder to avoid confusing the tokenizer.
-        def _clean(text: str, has_image: bool) -> str:
+        def _clean(text: str) -> str:
             if IMAGE_PLACEHOLDER in text:
                 text = text.replace(IMAGE_PLACEHOLDER, "").strip()
             return text
 
-        clean_qry_text = _clean(qry_text, qry_image is not None)
-        clean_pos_text = _clean(pos_text, pos_image is not None)
-        clean_neg_text = _clean(neg_text, neg_image is not None) if has_neg else ""
+        clean_qry_text = _clean(qry_text)
+        clean_pos_text = _clean(pos_text)
+        clean_neg_text = _clean(neg_text) if has_neg else ""
 
         query = {"text": clean_qry_text or None, "image": qry_image}
         positive = {"text": clean_pos_text or None, "image": pos_image}
@@ -187,16 +180,7 @@ class STSDataset(Dataset):
 
 
 def collate_embedding_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Collates a batch of dataset items into training-ready format.
-
-    Returns dict with:
-      - queries: list of dicts (text, image, instruction)
-      - positives: list of dicts (text, image, instruction)
-      - negatives: list of dicts or empty list
-      - task_types: list of str
-      - scores: tensor of floats (for STS) or None
-    """
+    """Collates a batch of dataset items into training-ready format."""
     queries = []
     positives = []
     negatives = []
@@ -226,6 +210,12 @@ def collate_embedding_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             negatives.append({
                 "text": n.get("text"),
                 "image": n.get("image"),
+                "instruction": default_instruction,
+            })
+        else:
+            negatives.append({
+                "text": p.get("text") or "NULL",
+                "image": None,
                 "instruction": default_instruction,
             })
 
