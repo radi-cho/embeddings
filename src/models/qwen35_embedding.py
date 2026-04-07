@@ -119,6 +119,7 @@ class Qwen35Embedder:
         fps: float = FPS,
         max_frames: int = MAX_FRAMES,
         default_instruction: str = "Represent the user's input.",
+        load_model: bool = True,
         **kwargs,
     ):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -130,9 +131,14 @@ class Qwen35Embedder:
         self.max_frames = max_frames
         self.default_instruction = default_instruction
 
-        self.model = Qwen35ForEmbedding.from_pretrained(
-            model_name_or_path, trust_remote_code=True, **kwargs
-        ).to(device)
+        if load_model:
+            self.model = Qwen35ForEmbedding.from_pretrained(
+                model_name_or_path, trust_remote_code=True, **kwargs
+            ).to(device)
+            self.model.eval()
+        else:
+            self.model = None
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
         self.tokenizer.padding_side = "right"
 
@@ -144,10 +150,10 @@ class Qwen35Embedder:
         except Exception:
             self.processor = None
 
-        self.model.eval()
-
     @torch.no_grad()
     def forward(self, inputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        if self.model is None:
+            raise RuntimeError("Qwen35Embedder has no model (load_model=False).")
         outputs = self.model(**inputs)
         return {
             "last_hidden_state": outputs.last_hidden_state,
@@ -285,7 +291,8 @@ class Qwen35Embedder:
             for ele in inputs
         ]
         processed = self._preprocess_inputs(conversations)
-        processed = {k: v.to(self.model.device) for k, v in processed.items()}
+        dev = self.model.device if self.model is not None else torch.device("cpu")
+        processed = {k: v.to(dev) for k, v in processed.items()}
         outputs = self.forward(processed)
         embeddings = self._pooling_last(outputs["last_hidden_state"], outputs["attention_mask"])
         if normalize:

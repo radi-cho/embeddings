@@ -10,6 +10,7 @@ build/
 /models/
 /outputs/
 /results/
+/datasets/mmeb_pretokenized/
 /datasets/poc_data/
 /datasets/mmeb_train_images/
 datasets/mmeb_cache/

@@ -9,9 +9,9 @@ Loads the TIGER-Lab/MMEB-train dataset from Hugging Face, supporting:
 - STS-style datasets (future) with real-valued similarity scores
 """
 
+import io
 import logging
 import os
-from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -37,7 +37,10 @@ TASK_TYPE_MAP = {
 }
 
 HF_MMEB_REPO = "TIGER-Lab/MMEB-train"
-IMAGE_PLACEHOLDER = "<|image_1|>"
+IMAGE_PLACEHOLDER = "<|image_1|>"  # MMEB text placeholder
+
+# Must match collate_embedding_batch / training embedder instruction
+DEFAULT_EMBED_INSTRUCTION = "Represent the user's input."
 
 
 def _build_hf_image_url(relative_path: str) -> str:
@@ -63,7 +66,7 @@ def _load_image_from_path(path: str, image_dir: Optional[str] = None) -> Optiona
         url = _build_hf_image_url(path)
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
-        return Image.open(BytesIO(resp.content)).convert("RGB")
+        return Image.open(io.BytesIO(resp.content)).convert("RGB")
     except Exception as e:
         logger.warning("Failed to load image from HF %s: %s", path, e)
         return None
@@ -188,7 +191,7 @@ def collate_embedding_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     scores = []
     has_scores = "score" in batch[0]
 
-    default_instruction = "Represent the user's input."
+    default_instruction = DEFAULT_EMBED_INSTRUCTION
 
     for item in batch:
         q = item["query"]
@@ -230,6 +233,125 @@ def collate_embedding_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "task_types": task_types,
         "scores": torch.tensor(scores, dtype=torch.float32) if scores else None,
     }
+
+
+def _tensor_dict_from_bytes(blob: bytes) -> Dict[str, torch.Tensor]:
+    buf = io.BytesIO(blob)
+    d = torch.load(buf, map_location="cpu", weights_only=False)
+    out = {}
+    for k, v in d.items():
+        if torch.is_tensor(v):
+            out[k] = v.contiguous()
+        else:
+            out[k] = v
+    return out
+
+
+def collate_pretokenized_embedding_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Collate pretokenized rows into lists of per-example processor dicts.
+
+    Vision tensors are not merged across examples; the training loop runs one
+    model forward per example within each micro-batch (still avoids CPU tokenization).
+    """
+    queries = [_tensor_dict_from_bytes(b["q_bytes"]) for b in batch]
+    positives = [_tensor_dict_from_bytes(b["p_bytes"]) for b in batch]
+    negatives = [_tensor_dict_from_bytes(b["n_bytes"]) for b in batch]
+
+    task_types = [b["task_type"] for b in batch]
+    scores = [b["score"] for b in batch] if "score" in batch[0] else None
+
+    return {
+        "queries": queries,
+        "positives": positives,
+        "negatives": negatives,
+        "task_types": task_types,
+        "scores": torch.tensor(scores, dtype=torch.float32) if scores else None,
+    }
+
+
+class PreTokenizedSubsetDataset(Dataset):
+    """One MMEB subset pre-tokenized with save_to_disk (memory-mapped Arrow)."""
+
+    def __init__(self, disk_path: str):
+        from datasets import load_from_disk
+        self.disk_path = disk_path
+        self.data = load_from_disk(disk_path)
+        self.subset_name = os.path.basename(os.path.normpath(disk_path))
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        row = self.data[idx]
+        item = {
+            "q_bytes": row["q_bytes"],
+            "p_bytes": row["p_bytes"],
+            "n_bytes": row["n_bytes"],
+            "task_type": row["task_type"],
+            "subset_name": row.get("subset_name", self.subset_name),
+        }
+        if "score" in row:
+            item["score"] = float(row["score"])
+        return item
+
+
+def build_pretokenized_mmeb_dataset(
+    pretokenized_dir: str,
+    subsets: Optional[List[str]] = None,
+    task_types: Optional[List[str]] = None,
+) -> ConcatDataset:
+    base = os.path.abspath(pretokenized_dir)
+    target = list(ALL_MMEB_SUBSETS)
+    if subsets:
+        target = [s for s in target if s in subsets]
+        unknown = set(subsets) - set(ALL_MMEB_SUBSETS)
+        if unknown:
+            logger.warning("Unknown subsets ignored: %s", unknown)
+    if task_types:
+        allowed = set()
+        for tt in task_types:
+            allowed.update(TASK_TYPE_MAP.get(tt, []))
+        target = [s for s in target if s in allowed]
+
+    parts: List[Dataset] = []
+    for name in target:
+        p = os.path.join(base, name)
+        if not os.path.isdir(p):
+            logger.warning("Missing pretokenized subset: %s", name)
+            continue
+        parts.append(PreTokenizedSubsetDataset(p))
+
+    if not parts:
+        raise RuntimeError(
+            f"No pretokenized subsets found under {base}. Run scripts/pretokenize_mmeb.py first."
+        )
+    combined = ConcatDataset(parts)
+    logger.info("Pretokenized combined dataset: %d examples from %d shards", len(combined), len(parts))
+    return combined
+
+
+def build_pretokenized_dataloader(
+    pretokenized_dir: str,
+    subsets: Optional[List[str]] = None,
+    task_types: Optional[List[str]] = None,
+    batch_size: int = 4,
+    num_workers: int = 0,
+    shuffle: bool = True,
+    pad_token_id: int = 0,
+) -> DataLoader:
+    del pad_token_id  # unused; kept for API compatibility with live dataloader
+    ds = build_pretokenized_mmeb_dataset(
+        pretokenized_dir, subsets=subsets, task_types=task_types)
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collate_pretokenized_embedding_batch,
+        num_workers=num_workers,
+        drop_last=True,
+        pin_memory=True,
+    )
 
 
 def build_mmeb_dataset(
