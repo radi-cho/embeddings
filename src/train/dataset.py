@@ -1,17 +1,19 @@
-"""
-Dataset module for MMEB multimodal embedding training.
+"""Dataset module for multimodal embedding training.
 
-Loads the TIGER-Lab/MMEB-train dataset from Hugging Face, supporting:
-- All 20 subsets by default, or user-selected subsets via CLI
-- Hard negatives (neg_text / neg_image_path) when available
-- Progress logging for download/loading
-- Text-only, image-only, and multimodal query/document formats
-- STS-style datasets (future) with real-valued similarity scores
+Data sources:
+- MMEB-train (TIGER-Lab/MMEB-train): 20 subsets, VQA/classification/retrieval
+- Text triplets: MS MARCO, AllNLI, GooAQ, Quora (JSONL)
+- STS-B: sentence pairs with float scores (JSONL)
+- MegaPairs: image-text triplets with hard negatives (JSONL annotations)
+- ColPali: visual document retrieval (Arrow with embedded images)
+- Video: LLaVA-Hound, MSR-VTT (JSONL manifests)
 """
 
 import io
+import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -37,406 +39,357 @@ TASK_TYPE_MAP = {
 }
 
 HF_MMEB_REPO = "TIGER-Lab/MMEB-train"
-IMAGE_PLACEHOLDER = "<|image_1|>"  # MMEB text placeholder
-
-# Must match collate_embedding_batch / training embedder instruction
+IMAGE_PLACEHOLDER = "<|image_1|>"
 DEFAULT_EMBED_INSTRUCTION = "Represent the user's input."
 
 
-def _build_hf_image_url(relative_path: str) -> str:
-    return f"https://huggingface.co/datasets/{HF_MMEB_REPO}/resolve/main/{relative_path}"
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-
-def _load_image_from_path(path: str, image_dir: Optional[str] = None) -> Optional[Image.Image]:
-    """Load an image from a local path or HF URL."""
+def _load_image(path: str, image_dir: Optional[str] = None) -> Optional[Image.Image]:
     if not path:
         return None
-
     if image_dir:
-        full = os.path.join(image_dir, path.replace("images/", "", 1) if path.startswith("images/") else path)
+        rel = path.replace("images/", "", 1) if path.startswith("images/") else path
+        full = os.path.join(image_dir, rel)
         if os.path.exists(full):
             try:
                 return Image.open(full).convert("RGB")
-            except Exception as e:
-                logger.warning("Failed to load local image %s: %s", full, e)
+            except Exception:
                 return None
-
     try:
         import requests
-        url = _build_hf_image_url(path)
+        url = f"https://huggingface.co/datasets/{HF_MMEB_REPO}/resolve/main/{path}"
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
         return Image.open(io.BytesIO(resp.content)).convert("RGB")
-    except Exception as e:
-        logger.warning("Failed to load image from HF %s: %s", path, e)
+    except Exception:
         return None
 
 
+def _clean_mmeb_text(text: str) -> str:
+    return text.replace(IMAGE_PLACEHOLDER, "").strip() if IMAGE_PLACEHOLDER in text else text
+
+
+def _infer_task_type(name: str) -> str:
+    for tt, subsets in TASK_TYPE_MAP.items():
+        if name in subsets:
+            return tt
+    return "retrieval"
+
+
+def _filter_subsets(subsets, task_types):
+    target = list(ALL_MMEB_SUBSETS)
+    if subsets:
+        target = [s for s in target if s in subsets]
+    if task_types:
+        allowed = {s for tt in task_types for s in TASK_TYPE_MAP.get(tt, [])}
+        target = [s for s in target if s in allowed]
+    return target
+
+
+def _load_jsonl(path: str, max_samples: Optional[int] = None) -> List[Dict]:
+    rows = []
+    with open(path) as f:
+        for line in f:
+            rows.append(json.loads(line))
+            if max_samples and len(rows) >= max_samples:
+                break
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Dataset classes
+# ---------------------------------------------------------------------------
+
 class MMEBDataset(Dataset):
-    """
-    Wraps a single MMEB-train subset. Each item yields a dict with:
-      - query: dict with keys text, image (PIL or None)
-      - positive: dict with keys text, image (PIL or None)
-      - negative: dict with keys text, image (PIL or None) or None
-      - task_type: str (classification, vqa, retrieval)
-      - subset_name: str
-    """
+    """Single MMEB-train subset."""
 
-    def __init__(
-        self,
-        subset_name: str,
-        split: str = "diverse_instruction",
-        image_dir: Optional[str] = None,
-        max_samples: Optional[int] = None,
-        cache_dir: Optional[str] = None,
-    ):
+    def __init__(self, subset_name: str, split="diverse_instruction",
+                 image_dir=None, max_samples=None, cache_dir=None):
         from datasets import load_dataset
-
         self.subset_name = subset_name
         self.image_dir = image_dir
-        self.task_type = self._infer_task_type(subset_name)
-
-        logger.info("Loading MMEB subset '%s' (split=%s) ...", subset_name, split)
-        ds = load_dataset(
-            HF_MMEB_REPO, subset_name,
-            split=split, streaming=False,
-            cache_dir=cache_dir,
-        )
+        self.task_type = _infer_task_type(subset_name)
+        ds = load_dataset(HF_MMEB_REPO, subset_name, split=split,
+                          streaming=False, cache_dir=cache_dir)
         if max_samples and max_samples < len(ds):
             ds = ds.select(range(max_samples))
         self.data = ds
-        logger.info("  '%s': %d examples loaded (task_type=%s)", subset_name, len(self.data), self.task_type)
+        logger.info("MMEB '%s': %d examples (task=%s)", subset_name, len(ds), self.task_type)
 
-    @staticmethod
-    def _infer_task_type(name: str) -> str:
-        for task_type, subsets in TASK_TYPE_MAP.items():
-            if name in subsets:
-                return task_type
-        return "retrieval"
-
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.data)
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        row = self.data[idx]
-
-        qry_text = row["qry"]
-        qry_image_path = row.get("qry_image_path", "")
-        pos_text = row.get("pos_text", "")
-        pos_image_path = row.get("pos_image_path", "")
-        neg_text = row.get("neg_text", "")
-        neg_image_path = row.get("neg_image_path", "")
-
-        qry_image = _load_image_from_path(qry_image_path, self.image_dir) if qry_image_path else None
-        pos_image = _load_image_from_path(pos_image_path, self.image_dir) if pos_image_path else None
-
-        has_neg = bool(neg_text or neg_image_path)
-        neg_image = None
-        if has_neg and neg_image_path:
-            neg_image = _load_image_from_path(neg_image_path, self.image_dir)
-
-        def _clean(text: str) -> str:
-            if IMAGE_PLACEHOLDER in text:
-                text = text.replace(IMAGE_PLACEHOLDER, "").strip()
-            return text
-
-        clean_qry_text = _clean(qry_text)
-        clean_pos_text = _clean(pos_text)
-        clean_neg_text = _clean(neg_text) if has_neg else ""
-
-        query = {"text": clean_qry_text or None, "image": qry_image}
-        positive = {"text": clean_pos_text or None, "image": pos_image}
-        negative = {"text": clean_neg_text or None, "image": neg_image} if has_neg else None
-
+    def __getitem__(self, idx):
+        r = self.data[idx]
+        qimg = _load_image(r.get("qry_image_path", ""), self.image_dir)
+        pimg = _load_image(r.get("pos_image_path", ""), self.image_dir)
+        has_neg = bool(r.get("neg_text") or r.get("neg_image_path"))
+        nimg = _load_image(r.get("neg_image_path", ""), self.image_dir) if has_neg else None
         return {
-            "query": query,
-            "positive": positive,
-            "negative": negative,
+            "query": {"text": _clean_mmeb_text(r["qry"]) or None, "image": qimg},
+            "positive": {"text": _clean_mmeb_text(r.get("pos_text", "")) or None, "image": pimg},
+            "negative": {"text": _clean_mmeb_text(r.get("neg_text", "")) or None,
+                         "image": nimg} if has_neg else None,
             "task_type": self.task_type,
             "subset_name": self.subset_name,
         }
 
 
 class STSDataset(Dataset):
-    """
-    For STS-style datasets with real-valued similarity scores.
-    Placeholder for future use; can wrap any dataset yielding
-    (sentence_a, sentence_b, score) triples.
-    """
+    """STS pairs with float scores from JSONL ({sentence1, sentence2, score})."""
 
-    def __init__(self, data: List[Tuple[str, str, float]]):
-        self.data = data
+    def __init__(self, jsonl_path: str, subset_name="stsb"):
+        self.subset_name = subset_name
+        self.data = [(r["sentence1"], r["sentence2"], float(r["score"]))
+                     for r in _load_jsonl(jsonl_path)]
+        logger.info("STSDataset '%s': %d rows", subset_name, len(self.data))
 
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.data)
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+    def __getitem__(self, idx):
         a, b, score = self.data[idx]
-        return {
-            "query": {"text": a, "image": None},
-            "positive": {"text": b, "image": None},
-            "negative": None,
-            "score": score,
-            "task_type": "sts",
-            "subset_name": "sts",
-        }
+        return {"query": {"text": a, "image": None},
+                "positive": {"text": b, "image": None},
+                "negative": None, "score": score,
+                "task_type": "sts", "subset_name": self.subset_name}
 
+
+class TextTripletDataset(Dataset):
+    """Text-only triplets from JSONL ({query, positive, negative?, task_type?})."""
+
+    def __init__(self, jsonl_path: str, subset_name=None, max_samples=None):
+        self.subset_name = subset_name or Path(jsonl_path).parent.name
+        self.data = _load_jsonl(jsonl_path, max_samples)
+        logger.info("TextTriplet '%s': %d rows", self.subset_name, len(self.data))
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        r = self.data[idx]
+        neg = r.get("negative")
+        return {"query": {"text": r["query"], "image": None},
+                "positive": {"text": r["positive"], "image": None},
+                "negative": {"text": neg, "image": None} if neg else None,
+                "task_type": r.get("task_type", "retrieval"),
+                "subset_name": self.subset_name}
+
+
+class MegaPairsDataset(Dataset):
+    """MegaPairs image-text triplets (JSONL: {q_img, q_texts, t_img, hns})."""
+
+    def __init__(self, jsonl_path: str, image_dir=None, max_samples=None):
+        self.image_dir = image_dir
+        self.data = _load_jsonl(jsonl_path, max_samples)
+        logger.info("MegaPairs: %d rows", len(self.data))
+
+    def __len__(self):
+        return len(self.data)
+
+    def _img(self, path):
+        if not path or not self.image_dir:
+            return None
+        full = os.path.join(self.image_dir, path)
+        try:
+            return Image.open(full).convert("RGB") if os.path.exists(full) else None
+        except Exception:
+            return None
+
+    def __getitem__(self, idx):
+        r = self.data[idx]
+        texts = r.get("q_texts") or r.get("q_text") or []
+        hns = r.get("hns", [])
+        neg_path = hns[1] if len(hns) > 1 else (hns[0] if hns else "")
+        neg_img = self._img(neg_path)
+        t_img = self._img(r.get("t_img", ""))
+        q_img = self._img(r.get("q_img", ""))
+        return {"query": {"text": texts[0] if texts else None, "image": q_img},
+                "positive": {"text": None, "image": t_img or q_img},
+                "negative": {"text": None, "image": neg_img} if neg_img else None,
+                "task_type": "retrieval", "subset_name": "MegaPairs"}
+
+
+class ColPaliDataset(Dataset):
+    """ColPali visual document retrieval (query text + page image, Arrow)."""
+
+    def __init__(self, data_dir: str, max_samples=None):
+        from datasets import load_from_disk
+        self.data = load_from_disk(data_dir)
+        if max_samples and max_samples < len(self.data):
+            self.data = self.data.select(range(max_samples))
+        logger.info("ColPali: %d rows", len(self.data))
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        r = self.data[idx]
+        img = r.get("image")
+        if img is not None and not isinstance(img, Image.Image):
+            try:
+                img = Image.open(io.BytesIO(img)).convert("RGB")
+            except Exception:
+                img = None
+        return {"query": {"text": r.get("query", ""), "image": None},
+                "positive": {"text": None, "image": img},
+                "negative": None,
+                "task_type": "retrieval", "subset_name": "ColPali"}
+
+
+class VideoTripletDataset(Dataset):
+    """Video-text pairs from JSONL ({query_text, positive_text, video_path})."""
+
+    def __init__(self, jsonl_path: str, video_root=None, subset_name=None, max_samples=None):
+        self.subset_name = subset_name or Path(jsonl_path).parent.name
+        self.video_root = video_root
+        self.data = _load_jsonl(jsonl_path, max_samples)
+        logger.info("VideoTriplet '%s': %d rows", self.subset_name, len(self.data))
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        r = self.data[idx]
+        vp = r.get("video_path", "")
+        if self.video_root and vp:
+            vp = os.path.join(self.video_root, vp)
+        return {"query": {"text": r.get("query_text"), "image": None,
+                          "video": vp or None},
+                "positive": {"text": r.get("positive_text"), "image": None},
+                "negative": None,
+                "task_type": r.get("task_type", "retrieval"),
+                "subset_name": self.subset_name}
+
+
+# ---------------------------------------------------------------------------
+# Collation
+# ---------------------------------------------------------------------------
 
 def collate_embedding_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Collates a batch of dataset items into training-ready format."""
-    queries = []
-    positives = []
-    negatives = []
-    task_types = []
-    scores = []
-    has_scores = "score" in batch[0]
+    """Collate items into {queries, positives, negatives, task_types, scores}.
 
-    default_instruction = DEFAULT_EMBED_INSTRUCTION
+    Items without hard negatives get None (no fake placeholders).
+    """
+    queries, positives, negatives, task_types, scores = [], [], [], [], []
+    has_scores = any("score" in item for item in batch)
+    has_neg = False
+    inst = DEFAULT_EMBED_INSTRUCTION
 
     for item in batch:
-        q = item["query"]
-        p = item["positive"]
+        for role, src in [("queries", "query"), ("positives", "positive")]:
+            d = item[src]
+            (queries if role == "queries" else positives).append({
+                "text": d.get("text"), "image": d.get("image"),
+                "video": d.get("video"), "instruction": inst})
 
-        queries.append({
-            "text": q.get("text"),
-            "image": q.get("image"),
-            "instruction": default_instruction,
-        })
-        positives.append({
-            "text": p.get("text"),
-            "image": p.get("image"),
-            "instruction": default_instruction,
-        })
-
-        if item.get("negative") is not None:
-            n = item["negative"]
-            negatives.append({
-                "text": n.get("text"),
-                "image": n.get("image"),
-                "instruction": default_instruction,
-            })
+        neg = item.get("negative")
+        if neg is not None:
+            negatives.append({"text": neg.get("text"), "image": neg.get("image"),
+                              "video": neg.get("video"), "instruction": inst})
+            has_neg = True
         else:
-            negatives.append({
-                "text": p.get("text") or "NULL",
-                "image": None,
-                "instruction": default_instruction,
-            })
+            negatives.append(None)
 
         task_types.append(item["task_type"])
         if has_scores:
-            scores.append(item["score"])
+            scores.append(item.get("score", 0.0))
 
-    return {
-        "queries": queries,
-        "positives": positives,
-        "negatives": negatives,
-        "task_types": task_types,
-        "scores": torch.tensor(scores, dtype=torch.float32) if scores else None,
-    }
+    return {"queries": queries, "positives": positives,
+            "negatives": negatives if has_neg else None,
+            "task_types": task_types,
+            "scores": torch.tensor(scores, dtype=torch.float32) if scores else None}
 
 
-def _tensor_dict_from_bytes(blob: bytes) -> Dict[str, torch.Tensor]:
-    buf = io.BytesIO(blob)
-    d = torch.load(buf, map_location="cpu", weights_only=False)
-    out = {}
-    for k, v in d.items():
-        if torch.is_tensor(v):
-            out[k] = v.contiguous()
-        else:
-            out[k] = v
-    return out
+# ---------------------------------------------------------------------------
+# Dataloader builders
+# ---------------------------------------------------------------------------
+
+def build_mmeb_dataset(subsets=None, task_types=None, split="diverse_instruction",
+                       image_dir=None, max_samples_per_subset=None, cache_dir=None):
+    target = _filter_subsets(subsets, task_types)
+    logger.info("Loading %d MMEB subsets", len(target))
+    parts = []
+    for i, name in enumerate(target):
+        logger.info("[%d/%d] %s", i + 1, len(target), name)
+        try:
+            parts.append(MMEBDataset(name, split=split, image_dir=image_dir,
+                                     max_samples=max_samples_per_subset, cache_dir=cache_dir))
+        except Exception as e:
+            logger.error("Failed '%s': %s", name, e)
+    if not parts:
+        raise RuntimeError("No MMEB subsets loaded")
+    combined = ConcatDataset(parts)
+    logger.info("MMEB total: %d examples from %d subsets", len(combined), len(parts))
+    return combined
 
 
-def collate_pretokenized_embedding_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Collate pretokenized rows into lists of per-example processor dicts.
-
-    Vision tensors are not merged across examples; the training loop runs one
-    model forward per example within each micro-batch (still avoids CPU tokenization).
-    """
-    queries = [_tensor_dict_from_bytes(b["q_bytes"]) for b in batch]
-    positives = [_tensor_dict_from_bytes(b["p_bytes"]) for b in batch]
-    negatives = [_tensor_dict_from_bytes(b["n_bytes"]) for b in batch]
-
-    task_types = [b["task_type"] for b in batch]
-    scores = [b["score"] for b in batch] if "score" in batch[0] else None
-
-    return {
-        "queries": queries,
-        "positives": positives,
-        "negatives": negatives,
-        "task_types": task_types,
-        "scores": torch.tensor(scores, dtype=torch.float32) if scores else None,
-    }
+def _make_dataloader(dataset, batch_size, num_workers, shuffle):
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
+                      collate_fn=collate_embedding_batch,
+                      num_workers=num_workers, drop_last=True, pin_memory=False)
 
 
-class PreTokenizedSubsetDataset(Dataset):
-    """One MMEB subset pre-tokenized with save_to_disk (memory-mapped Arrow)."""
-
-    def __init__(self, disk_path: str):
-        from datasets import load_from_disk
-        self.disk_path = disk_path
-        self.data = load_from_disk(disk_path)
-        self.subset_name = os.path.basename(os.path.normpath(disk_path))
-
-    def __len__(self) -> int:
-        return len(self.data)
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        row = self.data[idx]
-        item = {
-            "q_bytes": row["q_bytes"],
-            "p_bytes": row["p_bytes"],
-            "n_bytes": row["n_bytes"],
-            "task_type": row["task_type"],
-            "subset_name": row.get("subset_name", self.subset_name),
-        }
-        if "score" in row:
-            item["score"] = float(row["score"])
-        return item
+def build_dataloader(subsets=None, task_types=None, split="diverse_instruction",
+                     image_dir=None, max_samples_per_subset=None, cache_dir=None,
+                     batch_size=4, num_workers=0, shuffle=True):
+    ds = build_mmeb_dataset(subsets, task_types, split, image_dir,
+                            max_samples_per_subset, cache_dir)
+    return _make_dataloader(ds, batch_size, num_workers, shuffle)
 
 
-def build_pretokenized_mmeb_dataset(
-    pretokenized_dir: str,
-    subsets: Optional[List[str]] = None,
-    task_types: Optional[List[str]] = None,
-) -> ConcatDataset:
-    base = os.path.abspath(pretokenized_dir)
-    target = list(ALL_MMEB_SUBSETS)
-    if subsets:
-        target = [s for s in target if s in subsets]
-        unknown = set(subsets) - set(ALL_MMEB_SUBSETS)
-        if unknown:
-            logger.warning("Unknown subsets ignored: %s", unknown)
-    if task_types:
-        allowed = set()
-        for tt in task_types:
-            allowed.update(TASK_TYPE_MAP.get(tt, []))
-        target = [s for s in target if s in allowed]
-
+def build_mixed_dataloader(data_dir: str, image_dir=None,
+                           mmeb_split="diverse_instruction",
+                           max_samples_per_subset=None, cache_dir=None,
+                           batch_size=4, num_workers=0, shuffle=True):
+    """ConcatDataset from all sources under data_dir + MMEB from HF."""
+    base = Path(data_dir)
     parts: List[Dataset] = []
-    for name in target:
-        p = os.path.join(base, name)
-        if not os.path.isdir(p):
-            logger.warning("Missing pretokenized subset: %s", name)
-            continue
-        parts.append(PreTokenizedSubsetDataset(p))
+
+    try:
+        parts.append(build_mmeb_dataset(split=mmeb_split, image_dir=image_dir,
+                     max_samples_per_subset=max_samples_per_subset, cache_dir=cache_dir))
+    except Exception as e:
+        logger.error("MMEB-train: %s", e)
+
+    for name in ["msmarco", "allnli", "gooaq", "quora"]:
+        p = base / name / "train.jsonl"
+        if p.is_file():
+            parts.append(TextTripletDataset(str(p), name, max_samples_per_subset))
+
+    p = base / "stsb" / "train.jsonl"
+    if p.is_file():
+        parts.append(STSDataset(str(p)))
+
+    p = base / "megapairs" / "train.jsonl"
+    if p.is_file():
+        try:
+            parts.append(MegaPairsDataset(str(p), image_dir, max_samples_per_subset))
+        except Exception as e:
+            logger.error("MegaPairs: %s", e)
+
+    p = base / "colpali" / "data"
+    if p.is_dir():
+        try:
+            parts.append(ColPaliDataset(str(p), max_samples_per_subset))
+        except Exception as e:
+            logger.error("ColPali: %s", e)
+
+    p = base / "llava_hound" / "train.jsonl"
+    if p.is_file():
+        parts.append(VideoTripletDataset(str(p), subset_name="llava_hound"))
+
+    vr = base / "video_retrieval"
+    if vr.is_dir():
+        for jf in sorted(vr.glob("*.jsonl")):
+            parts.append(VideoTripletDataset(str(jf), subset_name=jf.stem))
 
     if not parts:
-        raise RuntimeError(
-            f"No pretokenized subsets found under {base}. Run scripts/pretokenize_mmeb.py first."
-        )
+        raise RuntimeError(f"No data under {data_dir}")
+
     combined = ConcatDataset(parts)
-    logger.info("Pretokenized combined dataset: %d examples from %d shards", len(combined), len(parts))
-    return combined
-
-
-def build_pretokenized_dataloader(
-    pretokenized_dir: str,
-    subsets: Optional[List[str]] = None,
-    task_types: Optional[List[str]] = None,
-    batch_size: int = 4,
-    num_workers: int = 0,
-    shuffle: bool = True,
-    pad_token_id: int = 0,
-) -> DataLoader:
-    del pad_token_id  # unused; kept for API compatibility with live dataloader
-    ds = build_pretokenized_mmeb_dataset(
-        pretokenized_dir, subsets=subsets, task_types=task_types)
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        collate_fn=collate_pretokenized_embedding_batch,
-        num_workers=num_workers,
-        drop_last=True,
-        pin_memory=True,
-    )
-
-
-def build_mmeb_dataset(
-    subsets: Optional[List[str]] = None,
-    task_types: Optional[List[str]] = None,
-    split: str = "diverse_instruction",
-    image_dir: Optional[str] = None,
-    max_samples_per_subset: Optional[int] = None,
-    cache_dir: Optional[str] = None,
-) -> ConcatDataset:
-    """
-    Build a concatenated dataset from MMEB-train subsets.
-
-    Args:
-        subsets: Specific subset names, or None for all.
-        task_types: Filter by task type (classification, vqa, retrieval).
-        split: HF dataset split name.
-        image_dir: Local directory with pre-downloaded images.
-        max_samples_per_subset: Cap per subset for debugging.
-        cache_dir: HF datasets cache directory.
-    """
-    target_subsets = list(ALL_MMEB_SUBSETS)
-
-    if subsets:
-        target_subsets = [s for s in target_subsets if s in subsets]
-        unknown = set(subsets) - set(ALL_MMEB_SUBSETS)
-        if unknown:
-            logger.warning("Unknown subsets ignored: %s", unknown)
-
-    if task_types:
-        allowed = set()
-        for tt in task_types:
-            allowed.update(TASK_TYPE_MAP.get(tt, []))
-        target_subsets = [s for s in target_subsets if s in allowed]
-
-    logger.info("Will load %d MMEB subsets: %s", len(target_subsets), target_subsets)
-    datasets = []
-    for i, name in enumerate(target_subsets):
-        logger.info("[%d/%d] Loading subset '%s' ...", i + 1, len(target_subsets), name)
-        try:
-            ds = MMEBDataset(
-                subset_name=name,
-                split=split,
-                image_dir=image_dir,
-                max_samples=max_samples_per_subset,
-                cache_dir=cache_dir,
-            )
-            datasets.append(ds)
-        except Exception as e:
-            logger.error("Failed to load subset '%s': %s", name, e)
-            continue
-
-    if not datasets:
-        raise RuntimeError("No datasets loaded successfully.")
-
-    combined = ConcatDataset(datasets)
-    logger.info("Combined dataset: %d total examples from %d subsets", len(combined), len(datasets))
-    return combined
-
-
-def build_dataloader(
-    subsets: Optional[List[str]] = None,
-    task_types: Optional[List[str]] = None,
-    split: str = "diverse_instruction",
-    image_dir: Optional[str] = None,
-    max_samples_per_subset: Optional[int] = None,
-    cache_dir: Optional[str] = None,
-    batch_size: int = 4,
-    num_workers: int = 0,
-    shuffle: bool = True,
-) -> DataLoader:
-    dataset = build_mmeb_dataset(
-        subsets=subsets,
-        task_types=task_types,
-        split=split,
-        image_dir=image_dir,
-        max_samples_per_subset=max_samples_per_subset,
-        cache_dir=cache_dir,
-    )
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        collate_fn=collate_embedding_batch,
-        num_workers=num_workers,
-        drop_last=True,
-        pin_memory=False,
-    )
+    logger.info("Mixed total: %d examples from %d sources", len(combined), len(parts))
+    return _make_dataloader(combined, batch_size, num_workers, shuffle)

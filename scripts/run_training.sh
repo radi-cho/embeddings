@@ -10,21 +10,20 @@ CUDA_DEVICES="${CUDA_DEVICES:-0,1}"
 MODEL_PATH="${MODEL_PATH:-${PROJECT_ROOT}/models/Qwen3.5-0.8B}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/outputs/qwen35-emb-mmeb}"
 IMAGE_DIR="${IMAGE_DIR:-}"
-PRETOKENIZED_DIR="${PRETOKENIZED_DIR:-}"
+DATA_DIR="${DATA_DIR:-}"
 SUBSETS="${SUBSETS:-}"
 TASK_TYPES="${TASK_TYPES:-}"
 MAX_SAMPLES="${MAX_SAMPLES:-}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
-NO_GRAD_CACHE="${NO_GRAD_CACHE:-false}"
 
-BATCH_SIZE="${BATCH_SIZE:-64}"
-EFFECTIVE_BATCH="${EFFECTIVE_BATCH:-2048}"
+CONTRASTIVE_BATCH="${CONTRASTIVE_BATCH:-1024}"
+MICRO_BATCH="${MICRO_BATCH:-4}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
 EPOCHS="${EPOCHS:-1}"
-LR="${LR:-1e-4}"
+LR="${LR:-2e-5}"
 TEMPERATURE="${TEMPERATURE:-0.02}"
 MAX_LENGTH="${MAX_LENGTH:-512}"
-MAX_PIXELS="${MAX_PIXELS:-401408}"
+MAX_PIXELS="${MAX_PIXELS:-1310720}"
 TRAINING_STAGE="${TRAINING_STAGE:-1}"
 MRL_DIMS="${MRL_DIMS:-1024,256,64}"
 LORA_RANK="${LORA_RANK:-32}"
@@ -46,15 +45,14 @@ IFS=',' read -ra GPU_ARRAY <<< "${CUDA_DEVICES}"
 NUM_GPUS=${#GPU_ARRAY[@]}
 
 echo "=============================================="
-echo " Qwen3.5-0.8B Embedding Training (GradCache)"
+echo " Qwen3.5-0.8B Contrastive Pretraining"
 echo "=============================================="
 echo "  GPUs:              ${CUDA_DEVICES} (${NUM_GPUS} devices)"
 echo "  Model:             ${MODEL_PATH}"
 echo "  Output:            ${OUTPUT_DIR}"
-echo "  Pretokenized dir:  ${PRETOKENIZED_DIR:-<live MMEB>}"
-echo "  Micro-batch/GPU:   ${BATCH_SIZE}"
-echo "  Effective batch:   ${EFFECTIVE_BATCH} (global)"
-echo "  Batch per rank:    $((EFFECTIVE_BATCH / NUM_GPUS))"
+echo "  Micro-batch/GPU:   ${MICRO_BATCH}"
+echo "  Contrastive batch: ${CONTRASTIVE_BATCH} (across all GPUs)"
+echo "  Per-device batch:  $((CONTRASTIVE_BATCH / NUM_GPUS))"
 echo "  Epochs:            ${EPOCHS}"
 echo "  LR:                ${LR}"
 echo "  Temperature:       ${TEMPERATURE}"
@@ -70,8 +68,7 @@ EXTRA_ARGS=""
 [ -n "${TASK_TYPES}" ] && EXTRA_ARGS="${EXTRA_ARGS} --task_types ${TASK_TYPES}"
 [ -n "${IMAGE_DIR}" ] && EXTRA_ARGS="${EXTRA_ARGS} --image_dir ${IMAGE_DIR}"
 [ -n "${MAX_SAMPLES}" ] && EXTRA_ARGS="${EXTRA_ARGS} --max_samples_per_subset ${MAX_SAMPLES}"
-[ -n "${PRETOKENIZED_DIR}" ] && EXTRA_ARGS="${EXTRA_ARGS} --pretokenized_dir ${PRETOKENIZED_DIR}"
-[ "${NO_GRAD_CACHE}" = "true" ] && EXTRA_ARGS="${EXTRA_ARGS} --no_grad_cache"
+[ -n "${DATA_DIR}" ] && EXTRA_ARGS="${EXTRA_ARGS} --data_dir ${DATA_DIR}"
 [ "${GRADIENT_CHECKPOINTING}" = "true" ] && EXTRA_ARGS="${EXTRA_ARGS} --gradient_checkpointing"
 if [ "${USE_WANDB}" = "true" ]; then
     EXTRA_ARGS="${EXTRA_ARGS} --use_wandb --wandb_project ${WANDB_PROJECT}"
@@ -82,7 +79,8 @@ fi
 ACCELERATE="${PYTHON} -m accelerate.commands.accelerate_cli"
 
 COMMON_ARGS="--model_path ${MODEL_PATH} --output_dir ${OUTPUT_DIR} \
-    --batch_size ${BATCH_SIZE} --effective_batch_size ${EFFECTIVE_BATCH} \
+    --contrastive_batch_size ${CONTRASTIVE_BATCH} \
+    --micro_batch_size ${MICRO_BATCH} \
     --gradient_accumulation_steps ${GRAD_ACCUM} \
     --epochs ${EPOCHS} --lr ${LR} --temperature ${TEMPERATURE} \
     --max_length ${MAX_LENGTH} --max_pixels ${MAX_PIXELS} \
