@@ -21,7 +21,7 @@ fi
 CSV="${ROOT}/Qwen3-Embedding/tmp_sts_only.csv"
 PY="${ROOT}/.venv/bin/python"
 EVAL="${ROOT}/Qwen3-Embedding/evaluation"
-MMEB="${ROOT}/src/eval/run_mmeb.py"
+MMEB="${ROOT}/eval/run_mmeb.py"
 LOG="${ROOT}/scheduler_logs"
 mkdir -p "${LOG}"
 TS="$(date +%Y%m%d_%H%M%S)"

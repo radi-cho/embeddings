@@ -7,19 +7,19 @@ Uses the same model loading as the eval harnesses.
 
 Usage:
     # Text vs text
-    python src/manual-tests/similarity.py --model_path models/Qwen3-VL-Embedding-2B \
+    python src/manual-tests/similarity.py --model_path models/checkpoints/Qwen3-VL-Embedding-2B \
         --a "a cat sitting on a couch" --b "a dog playing in the yard"
 
     # Text vs image
-    python src/manual-tests/similarity.py --model_path models/Qwen3-VL-Embedding-2B \
+    python src/manual-tests/similarity.py --model_path models/checkpoints/Qwen3-VL-Embedding-2B \
         --a "a cat" --b_image path/to/cat.jpg
 
     # Image vs image
-    python src/manual-tests/similarity.py --model_path models/Qwen3-VL-Embedding-2B \
+    python src/manual-tests/similarity.py --model_path models/checkpoints/Qwen3-VL-Embedding-2B \
         --a_image img1.png --b_image img2.png
 
     # With instructions
-    python src/manual-tests/similarity.py --model_path models/Qwen3-VL-Embedding-2B \
+    python src/manual-tests/similarity.py --model_path models/checkpoints/Qwen3-VL-Embedding-2B \
         --a "what breed is this cat?" --a_instruction "Represent the query." \
         --b_image cat.jpg --b_instruction "Represent the document."
 """
@@ -31,10 +31,10 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.eval.eval_utils import load_model
+from eval.eval_utils import load_model
 
 
 def build_item(text=None, image=None, instruction=None):

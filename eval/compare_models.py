@@ -2,8 +2,8 @@
 """Compare MMTEB results between two models side-by-side.
 
 Usage:
-  python src/eval/compare_models.py --results_a results/qwen3vl --results_b results/qwen35
-  python src/eval/compare_models.py --model_a Qwen/Qwen3-VL-Embedding-2B --model_b models/Qwen3.5-0.8B
+  python eval/compare_models.py --results_a results/qwen3vl --results_b results/qwen35
+  python eval/compare_models.py --model_a Qwen/Qwen3-VL-Embedding-2B --model_b models/checkpoints/Qwen3.5-0.8B
 """
 import argparse
 import json
@@ -26,7 +26,7 @@ def run_eval_if_needed(model_path: str, output_dir: str, fast_tasks_only: bool =
         print(f"Results already exist at {output_dir}, skipping eval")
         return
     cmd = [
-        sys.executable, "src/eval/run_mmteb.py",
+        sys.executable, "eval/run_mmteb.py",
         "--model_path", model_path,
         "--output_dir", output_dir,
     ]

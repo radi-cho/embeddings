@@ -13,22 +13,22 @@ matches `Qwen3-VL-Embedding`’s `scripts/qwen3_vl_embedding.py` (1800 vision to
 
 Usage:
     # First: download MMEB-V2 image tarball (one-time, ~7 GB)
-    python src/eval/run_mmeb.py --download_images --cache_dir datasets/mmeb_cache
+    python eval/run_mmeb.py --download_images --cache_dir datasets/mmeb_cache
 
     # Quick eval: 4 tasks, one per category (~15 min)
-    python src/eval/run_mmeb.py --model_path models/Qwen3-VL-Embedding-2B \
+    python eval/run_mmeb.py --model_path models/checkpoints/Qwen3-VL-Embedding-2B \
         --quick
 
     # Specific tasks
-    python src/eval/run_mmeb.py --model_path models/Qwen3-VL-Embedding-2B \
+    python eval/run_mmeb.py --model_path models/checkpoints/Qwen3-VL-Embedding-2B \
         --tasks N24News OK-VQA
 
     # All 36 image tasks
-    python src/eval/run_mmeb.py --model_path models/Qwen3-VL-Embedding-2B \
+    python eval/run_mmeb.py --model_path models/checkpoints/Qwen3-VL-Embedding-2B \
         --full
 
     # List available tasks
-    python src/eval/run_mmeb.py --list_tasks
+    python eval/run_mmeb.py --list_tasks
 """
 
 import argparse
@@ -43,8 +43,8 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-from src.eval.eval_utils import (
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from eval.eval_utils import (
     attach_run_log, detect_model_type, load_model, embed_batch,
 )
 

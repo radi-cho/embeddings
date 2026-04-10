@@ -22,17 +22,17 @@ Directory structure (under --visdoc_dir, default: datasets/mmeb_cache/visdoc-tas
 
 Usage:
     # Quick eval: 1 task per sub-benchmark
-    python src/eval/run_mmeb_visdoc.py --model_path models/Qwen3-VL-Embedding-2B --quick
+    python eval/run_mmeb_visdoc.py --model_path models/checkpoints/Qwen3-VL-Embedding-2B --quick
 
     # Specific tasks
-    python src/eval/run_mmeb_visdoc.py --model_path models/Qwen3-VL-Embedding-2B \\
+    python eval/run_mmeb_visdoc.py --model_path models/checkpoints/Qwen3-VL-Embedding-2B \\
         --tasks ViDoRe_arxivqa VisRAG_ChartQA
 
     # All 24 active tasks (matches Qwen visdoc.yaml)
-    python src/eval/run_mmeb_visdoc.py --model_path models/Qwen3-VL-Embedding-2B --full
+    python eval/run_mmeb_visdoc.py --model_path models/checkpoints/Qwen3-VL-Embedding-2B --full
 
     # List available tasks
-    python src/eval/run_mmeb_visdoc.py --list_tasks
+    python eval/run_mmeb_visdoc.py --list_tasks
 """
 
 import argparse
@@ -49,8 +49,8 @@ import torch
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-from src.eval.eval_utils import attach_run_log, load_model, embed_batch
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from eval.eval_utils import attach_run_log, load_model, embed_batch
 
 # ---------------------------------------------------------------------------
 # Constants

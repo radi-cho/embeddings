@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def attach_run_log(output_dir: Path) -> None:
@@ -124,7 +124,7 @@ def load_model(
                          max_length=max_length, min_pixels=mip, max_pixels=mp), "qwen3vl"
     else:
         sys.path.insert(0, str(PROJECT_ROOT))
-        from src.models.qwen35_embedding import Qwen35Embedder
+        from models.qwen35_embedding import Qwen35Embedder
         logger.info("Loading Qwen3.5 from %s (max_length=%s)", model_path, max_length)
         return Qwen35Embedder(model_name_or_path=model_path, torch_dtype=torch.bfloat16,
                               max_length=max_length, min_pixels=mip, max_pixels=mp), "qwen35"

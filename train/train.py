@@ -26,10 +26,10 @@ from peft import LoraConfig, TaskType, get_peft_model
 from torch.optim import AdamW
 from transformers import get_cosine_schedule_with_warmup
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.train.dataset import build_dataloader, build_mixed_dataloader
-from src.train.losses import (
+from train.dataset import build_dataloader, build_mixed_dataloader
+from train.losses import (
     cosent_loss, masked_infonce_loss, mrl_cosent_loss, mrl_infonce_loss,
 )
 
@@ -295,7 +295,7 @@ def _load_embedder(model_path, max_length, model_type, max_pixels=None):
         from qwen3_vl_embedding import Qwen3VLEmbedder
         return Qwen3VLEmbedder(model_name_or_path=model_path,
                                torch_dtype=torch.bfloat16, max_length=max_length, **kw)
-    from src.models.qwen35_embedding import Qwen35Embedder
+    from models.qwen35_embedding import Qwen35Embedder
     return Qwen35Embedder(model_name_or_path=model_path,
                           torch_dtype=torch.bfloat16, max_length=max_length, **kw)
 

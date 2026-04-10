@@ -2,9 +2,9 @@
 """MMTEB evaluation for Qwen3.5 embedding models and Qwen3-VL-Embedding baselines.
 
 Usage:
-  python src/eval/run_mmteb.py --model_path models/Qwen3.5-0.8B --output_dir results/qwen35
-  python src/eval/run_mmteb.py --model_path Qwen/Qwen3-VL-Embedding-2B --output_dir results/qwen3vl
-  python src/eval/run_mmteb.py --model_path models/Qwen3.5-0.8B --full --output_dir results/full
+  python eval/run_mmteb.py --model_path models/checkpoints/Qwen3.5-0.8B --output_dir results/qwen35
+  python eval/run_mmteb.py --model_path Qwen/Qwen3-VL-Embedding-2B --output_dir results/qwen3vl
+  python eval/run_mmteb.py --model_path models/checkpoints/Qwen3.5-0.8B --full --output_dir results/full
 """
 import argparse
 import json
@@ -19,7 +19,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -87,7 +87,7 @@ def detect_model_type(model_path: str) -> str:
 
 
 def load_qwen35_embedder(model_path: str, **kwargs):
-    from src.models.qwen35_embedding import Qwen35Embedder
+    from models.qwen35_embedding import Qwen35Embedder
     lora_path = kwargs.get("lora_path", None)
     base_path = kwargs.get("base_model_path", model_path)
 
@@ -106,7 +106,7 @@ def load_qwen35_embedder(model_path: str, **kwargs):
     if adapter_config.exists():
         with open(adapter_config) as f:
             acfg = json.load(f)
-        real_base = acfg.get("base_model_name_or_path", "models/Qwen3.5-0.8B")
+        real_base = acfg.get("base_model_name_or_path", "models/checkpoints/Qwen3.5-0.8B")
         embedder = Qwen35Embedder(
             model_name_or_path=real_base,
             torch_dtype=torch.bfloat16,

@@ -41,7 +41,7 @@ torch.set_num_threads(1)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.train.dataset import ALL_MMEB_SUBSETS
+from train.dataset import ALL_MMEB_SUBSETS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -127,8 +127,8 @@ def pretokenize_one_subset(args_tuple) -> str:
         logger.info("[%s] SKIP (already on disk)", subset_name)
         return f"{subset_name}: skipped"
 
-    from src.models.qwen35_embedding import Qwen35Embedder
-    from src.train.dataset import MMEBDataset, DEFAULT_EMBED_INSTRUCTION
+    from models.qwen35_embedding import Qwen35Embedder
+    from train.dataset import MMEBDataset, DEFAULT_EMBED_INSTRUCTION
 
     embedder = Qwen35Embedder(
         model_name_or_path=model_path, max_length=max_length,
@@ -207,7 +207,7 @@ def pretokenize_one_subset(args_tuple) -> str:
 
 def main():
     pa = argparse.ArgumentParser()
-    pa.add_argument("--model_path", default=str(PROJECT_ROOT / "models/Qwen3.5-0.8B"))
+    pa.add_argument("--model_path", default=str(PROJECT_ROOT / "models/checkpoints/Qwen3.5-0.8B"))
     pa.add_argument("--output_dir", default=str(PROJECT_ROOT / "datasets/mmeb_pretokenized"))
     pa.add_argument("--split", default="diverse_instruction")
     pa.add_argument("--image_dir", default=None)

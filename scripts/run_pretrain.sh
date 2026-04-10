@@ -12,7 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(dirname "$SCRIPT_DIR")"
 PY="${ROOT}/.venv/bin/python"
-TRAIN="${ROOT}/src/train/train.py"
+TRAIN="${ROOT}/train/train.py"
 
 # --- Load HF token ---
 if [[ -z "${HF_TOKEN:-}" && -f "${ROOT}/.hf_token_local" ]]; then
@@ -21,7 +21,7 @@ fi
 
 # --- Configuration (all overridable via env) ---
 : "${CUDA_DEVICES:=0,1}"
-: "${MODEL_PATH:=${ROOT}/models/Qwen3.5-0.8B}"
+: "${MODEL_PATH:=${ROOT}/models/checkpoints/Qwen3.5-0.8B}"
 : "${OUTPUT_DIR:=/data/outputs/qwen35-0.8b-10M-pretrain}"
 : "${IMAGE_DIR:=${ROOT}/datasets/mmeb_train_images/images}"
 : "${DATA_DIR:=/data/training_data}"

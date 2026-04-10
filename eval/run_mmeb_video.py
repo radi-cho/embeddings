@@ -28,18 +28,18 @@ Directory structure (under --video_dir, default: datasets/mmeb_cache/video-tasks
 
 Usage:
     # Quick eval: 1 task per category (~HMDB51, MSR-VTT, NExTQA, QVHighlight)
-    python src/eval/run_mmeb_video.py --model_path models/Qwen3-VL-Embedding-2B \\
+    python eval/run_mmeb_video.py --model_path models/checkpoints/Qwen3-VL-Embedding-2B \\
         --video_dir datasets/mmeb_cache/video-tasks --quick
 
     # Specific tasks
-    python src/eval/run_mmeb_video.py --model_path models/Qwen3-VL-Embedding-2B \\
+    python eval/run_mmeb_video.py --model_path models/checkpoints/Qwen3-VL-Embedding-2B \\
         --tasks HMDB51 MSR-VTT NExTQA
 
     # All 18 video tasks
-    python src/eval/run_mmeb_video.py --model_path models/Qwen3-VL-Embedding-2B --full
+    python eval/run_mmeb_video.py --model_path models/checkpoints/Qwen3-VL-Embedding-2B --full
 
     # List available tasks
-    python src/eval/run_mmeb_video.py --list_tasks
+    python eval/run_mmeb_video.py --list_tasks
 """
 
 import argparse
@@ -57,8 +57,8 @@ import torch
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-from src.eval.eval_utils import attach_run_log, load_model, embed_batch
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from eval.eval_utils import attach_run_log, load_model, embed_batch
 
 # ---------------------------------------------------------------------------
 # Constants

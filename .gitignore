@@ -7,7 +7,7 @@ dist/
 build/
 .eggs/
 
-/models/
+/models/checkpoints/
 /outputs/
 /results/
 /datasets/mmeb_pretokenized/
