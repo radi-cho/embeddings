@@ -1,6 +1,4 @@
-# Setup
-
-Reproduce multimodal embedding model training and evaluation from scratch.
+# cho-embedding-0.8b
 
 ## Environment
 
