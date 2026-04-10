@@ -43,7 +43,6 @@ Usage:
 """
 
 import argparse
-import importlib.util
 import json
 import logging
 import os
@@ -51,32 +50,15 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-
-def attach_run_log(output_dir: Path) -> None:
-    """Append run.log under output_dir."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    fh = logging.FileHandler(output_dir / "run.log", encoding="utf-8")
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logging.getLogger().addHandler(fh)
-    logger.info("Logging to %s", (output_dir / "run.log").resolve())
-
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+from src.eval.eval_utils import attach_run_log, load_model, embed_batch
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -393,120 +375,14 @@ def qa_template(question, candidates, answer):
     return q, options, ans_str, answer_idx
 
 
-# ---------------------------------------------------------------------------
-# Model loading  (same pattern as run_mmeb.py)
-# ---------------------------------------------------------------------------
-
-def load_model(
-    model_path,
-    *,
-    max_length: int = 16384,
-    image_min_pixels: Optional[int] = None,
-    image_max_pixels: Optional[int] = None,
-):
-    """Load embedding model, auto-detecting Qwen3-VL vs Qwen3.5."""
-    config_path = Path(model_path) / "config.json"
-    model_type = ""
-    if config_path.exists():
-        with open(config_path) as f:
-            model_type = json.load(f).get("model_type", "")
-
-    mip = MMEB_IMAGE_MIN_PIXELS if image_min_pixels is None else image_min_pixels
-    mp = MMEB_IMAGE_MAX_PIXELS if image_max_pixels is None else image_max_pixels
-
-    if "qwen3_vl" in model_type:
-        scripts_dir = Path(model_path) / "scripts"
-        if scripts_dir.exists():
-            sys.path.insert(0, str(scripts_dir))
-        from qwen3_vl_embedding import Qwen3VLEmbedder
-
-        class _Embedder(Qwen3VLEmbedder):
-            """Pass per-item min/max_pixels for images (upstream ignores these keys)."""
-
-            def process(self, inputs, normalize=True):
-                conversations = []
-                for ele in inputs:
-                    conv = self.format_model_input(
-                        text=ele.get("text"),
-                        image=ele.get("image"),
-                        video=ele.get("video"),
-                        instruction=ele.get("instruction"),
-                        fps=ele.get("fps"),
-                        max_frames=ele.get("max_frames"),
-                    )
-                    for msg in conv:
-                        for part in msg.get("content", []):
-                            if isinstance(part, dict) and part.get("type") == "image":
-                                if ele.get("max_pixels") is not None:
-                                    part["max_pixels"] = ele["max_pixels"]
-                                if ele.get("min_pixels") is not None:
-                                    part["min_pixels"] = ele["min_pixels"]
-                    conversations.append(conv)
-                processed = self._preprocess_inputs(conversations)
-                processed = {k: v.to(self.model.device) for k, v in processed.items()}
-                out = self.forward(processed)
-                embs = self._pooling_last(out["last_hidden_state"], out["attention_mask"])
-                if normalize:
-                    embs = F.normalize(embs, p=2, dim=-1)
-                return embs
-
-        logger.info("Loading Qwen3-VL from %s (max_length=%s)", model_path, max_length)
-        model = _Embedder(
-            model_name_or_path=model_path,
-            torch_dtype=torch.bfloat16,
-            max_length=max_length,
-            min_pixels=mip,
-            max_pixels=mp,
-        )
-        return model, "qwen3vl"
-    else:
-        from src.models.qwen35_embedding import Qwen35Embedder
-
-        logger.info("Loading Qwen3.5 from %s (max_length=%s)", model_path, max_length)
-        model = Qwen35Embedder(
-            model_name_or_path=model_path,
-            torch_dtype=torch.bfloat16,
-            max_length=max_length,
-            min_pixels=mip,
-            max_pixels=mp,
-        )
-        return model, "qwen35"
-
-
-# ---------------------------------------------------------------------------
-# Embedding helpers  (same as run_mmeb.py)
-# ---------------------------------------------------------------------------
-
-def embed_batch(model, items, batch_size=8):
-    """Embed a list of dicts in micro-batches with CUDA OOM recovery.
-
-    Default batch_size is 8 (lower than image eval) because video inputs are
-    much larger in token count.
-    """
-    all_embs = []
-    i, n = 0, len(items)
-    while i < n:
-        chunk = min(batch_size, n - i)
-        while chunk >= 1:
-            batch = items[i : i + chunk]
-            try:
-                with torch.no_grad():
-                    embs = model.process(batch)
-                all_embs.append(embs.cpu().float())
-                i += chunk
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                break
-            except torch.cuda.OutOfMemoryError:
-                if chunk <= 1:
-                    raise
-                chunk = max(1, chunk // 2)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                logger.warning(
-                    "CUDA OOM; retrying chunk=%d (index %d)", chunk, i,
-                )
-    return torch.cat(all_embs, dim=0)
+def load_video_model(model_path, *, max_length=16384,
+                     image_min_pixels=None, image_max_pixels=None):
+    return load_model(
+        model_path, max_length=max_length,
+        default_min_pixels=MMEB_IMAGE_MIN_PIXELS,
+        default_max_pixels=MMEB_IMAGE_MAX_PIXELS,
+        image_min_pixels=image_min_pixels,
+        image_max_pixels=image_max_pixels)
 
 
 # ---------------------------------------------------------------------------
@@ -1087,7 +963,7 @@ def main():
     logger.info("Video dir: %s", args.video_dir)
 
     # Load model
-    model, model_type = load_model(
+    model, model_type = load_video_model(
         args.model_path,
         max_length=args.max_length,
         image_min_pixels=args.image_min_pixels,

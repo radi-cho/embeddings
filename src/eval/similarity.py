@@ -25,51 +25,16 @@ Usage:
 """
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-
-def load_model(model_path, max_length=16384):
-    config_path = Path(model_path) / "config.json"
-    model_type = ""
-    if config_path.exists():
-        with open(config_path) as f:
-            model_type = json.load(f).get("model_type", "")
-
-    min_pixels = 4 * 32 * 32
-    max_pixels = 1800 * 32 * 32
-
-    if "qwen3_vl" in model_type:
-        scripts_dir = Path(model_path) / "scripts"
-        if scripts_dir.exists():
-            sys.path.insert(0, str(scripts_dir))
-        from qwen3_vl_embedding import Qwen3VLEmbedder
-
-        model = Qwen3VLEmbedder(
-            model_name_or_path=model_path,
-            torch_dtype=torch.bfloat16,
-            max_length=max_length,
-            min_pixels=min_pixels,
-            max_pixels=max_pixels,
-        )
-    else:
-        from src.models.qwen35_embedding import Qwen35Embedder
-
-        model = Qwen35Embedder(
-            model_name_or_path=model_path,
-            torch_dtype=torch.bfloat16,
-            max_length=max_length,
-            min_pixels=min_pixels,
-            max_pixels=max_pixels,
-        )
-    return model
+from src.eval.eval_utils import load_model
 
 
 def build_item(text=None, image=None, instruction=None):
@@ -97,7 +62,7 @@ def main():
     p.add_argument("--b_instruction", type=str, default=None)
     args = p.parse_args()
 
-    model = load_model(args.model_path, args.max_length)
+    model, _ = load_model(args.model_path, max_length=args.max_length)
 
     item_a = build_item(args.a, args.a_image, args.a_instruction)
     item_b = build_item(args.b, args.b_image, args.b_instruction)

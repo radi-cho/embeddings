@@ -32,22 +32,21 @@ Usage:
 """
 
 import argparse
-import importlib.util
 import json
 import os
 import sys
 import logging
-from typing import Optional
 import torch
-import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+from src.eval.eval_utils import (
+    attach_run_log, detect_model_type, load_model, embed_batch,
+)
 
 
 def _atomic_write_json(path: Path, obj: dict) -> None:
@@ -90,21 +89,7 @@ def _mmeb_summary_dict(results: list, args, model_type: str) -> dict:
     }
 
 
-def attach_run_log(output_dir: Path) -> None:
-    """Append MMTEB-style run.log under output_dir (full timestamp lines)."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    log_path = output_dir / "run.log"
-    fh = logging.FileHandler(log_path, encoding="utf-8")
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logging.getLogger().addHandler(fh)
-    logger.info("Logging to %s", log_path.resolve())
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
-
-# Test queries, candidates, instructions (per-task configs). Same HF id as VLM2Vec MMEB-V2 eval.
 MMEB_TEST_INSTRUCTIONS = "ziyjiang/MMEB_Test_Instruct"
 # Official MMEB-V2 image release (parquet-free; media only).
 MMEB_V2_MEDIA_REPO = "TIGER-Lab/MMEB-V2"
@@ -231,172 +216,16 @@ def find_image_dir(cache_dir):
     return None
 
 
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-
-def load_model(
-    model_path,
-    *,
-    max_length: int = 16384,
-    image_min_pixels: Optional[int] = None,
-    image_max_pixels: Optional[int] = None,
-):
-    """Load embedding model, auto-detecting Qwen3-VL vs Qwen3.5.
-
-    `max_length` defaults to 16,384 per Qwen3-VL paper Sec. 6.1. Vision caps are enforced on
-    Qwen3-VL via `min_pixels` / `max_pixels` (default matches upstream Qwen3-VL-Embedding).
-    """
-    config_path = Path(model_path) / "config.json"
-    model_type = ""
-    if config_path.exists():
-        with open(config_path) as f:
-            model_type = json.load(f).get("model_type", "")
-    if not model_type:
-        try:
-            from transformers import AutoConfig
-
-            cfg = AutoConfig.from_pretrained(str(model_path), trust_remote_code=True)
-            model_type = getattr(cfg, "model_type", "") or ""
-        except Exception as e:
-            logger.debug("Could not load remote config for %s: %s", model_path, e)
-
-    path_str = str(model_path)
-    is_qwen3_vl = "qwen3_vl" in model_type.lower()
-    if not is_qwen3_vl and ("Qwen3-VL" in path_str or "qwen3-vl" in path_str.lower()):
-        is_qwen3_vl = True
-
-    mip = MMEB_IMAGE_MIN_PIXELS if image_min_pixels is None else image_min_pixels
-    mp = MMEB_IMAGE_MAX_PIXELS if image_max_pixels is None else image_max_pixels
-
-    if is_qwen3_vl:
-        mp_local = Path(model_path)
-        local_script = mp_local / "scripts" / "qwen3_vl_embedding.py"
-        vendor_script = (
-            Path(__file__).resolve().parents[2]
-            / "Qwen3-VL-Embedding"
-            / "src"
-            / "models"
-            / "qwen3_vl_embedding.py"
-        )
-        if local_script.is_file():
-            sys.path.insert(0, str(mp_local / "scripts"))
-            from qwen3_vl_embedding import Qwen3VLEmbedder
-        elif vendor_script.is_file():
-            _vn = "_qwen3_vl_embedding_vendor"
-            spec = importlib.util.spec_from_file_location(_vn, vendor_script)
-            _mod = importlib.util.module_from_spec(spec)
-            assert spec.loader is not None
-            sys.modules[_vn] = _mod
-            spec.loader.exec_module(_mod)
-            Qwen3VLEmbedder = _mod.Qwen3VLEmbedder
-        else:
-            raise ImportError(
-                "Qwen3-VL MMEB needs scripts/qwen3_vl_embedding.py under the model path, "
-                f"or the vendor file at {vendor_script}"
-            )
-
-        class _MMEBQwen3VLEmbedder(Qwen3VLEmbedder):
-            """Applies optional per-item min/max_pixels from MMEB `make_item` (upstream ignores these keys)."""
-
-            def process(self, inputs, normalize=True):
-                conversations = []
-                for ele in inputs:
-                    conv = self.format_model_input(
-                        text=ele.get("text"),
-                        image=ele.get("image"),
-                        video=ele.get("video"),
-                        instruction=ele.get("instruction"),
-                        fps=ele.get("fps"),
-                        max_frames=ele.get("max_frames"),
-                    )
-                    for msg in conv:
-                        for part in msg.get("content", []):
-                            if isinstance(part, dict) and part.get("type") == "image":
-                                if ele.get("max_pixels") is not None:
-                                    part["max_pixels"] = ele["max_pixels"]
-                                if ele.get("min_pixels") is not None:
-                                    part["min_pixels"] = ele["min_pixels"]
-                    conversations.append(conv)
-
-                processed_inputs = self._preprocess_inputs(conversations)
-                processed_inputs = {k: v.to(self.model.device) for k, v in processed_inputs.items()}
-                outputs = self.forward(processed_inputs)
-                embeddings = self._pooling_last(
-                    outputs["last_hidden_state"], outputs["attention_mask"]
-                )
-                if normalize:
-                    embeddings = F.normalize(embeddings, p=2, dim=-1)
-                return embeddings
-
-        logger.info(
-            "Loading Qwen3-VL from %s (max_length=%s, image max_pixels=%s)",
-            model_path,
-            max_length,
-            mp,
-        )
-        model = _MMEBQwen3VLEmbedder(
-            model_name_or_path=model_path,
-            torch_dtype=torch.bfloat16,
-            max_length=max_length,
-            min_pixels=mip,
-            max_pixels=mp,
-        )
-        return model, "qwen3vl"
-    else:
-        from src.models.qwen35_embedding import Qwen35Embedder
-
-        logger.info(
-            "Loading Qwen3.5 from %s (max_length=%s, image max_pixels=%s)",
-            model_path,
-            max_length,
-            mp,
-        )
-        model = Qwen35Embedder(
-            model_name_or_path=model_path,
-            torch_dtype=torch.bfloat16,
-            max_length=max_length,
-            min_pixels=mip,
-            max_pixels=mp,
-        )
-        return model, "qwen35"
-
-
-# ---------------------------------------------------------------------------
-# Embedding helpers
-# ---------------------------------------------------------------------------
-
-def embed_batch(model, items, batch_size=32):
-    """Embed a list of dicts (text/image/instruction) in batches.
-
-    On CUDA OOM, halves the micro-batch down to 1 (same strategy as run_mmteb.py).
-    """
-    all_embs = []
-    i, n = 0, len(items)
-    while i < n:
-        chunk = min(batch_size, n - i)
-        while chunk >= 1:
-            batch = items[i : i + chunk]
-            try:
-                with torch.no_grad():
-                    embs = model.process(batch)
-                all_embs.append(embs.cpu().float())
-                i += chunk
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                break
-            except torch.cuda.OutOfMemoryError:
-                if chunk <= 1:
-                    raise
-                chunk = max(1, chunk // 2)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                logger.warning(
-                    "CUDA OOM during MMEB embed; retrying with chunk size %d (start index %d)",
-                    chunk,
-                    i,
-                )
-    return torch.cat(all_embs, dim=0)
+# load_model and embed_batch are imported from eval_utils (shared across MMEB scripts).
+# MMEB defaults: min_pixels = 4*32*32, max_pixels = 1800*32*32 (per paper Sec. 6.1).
+def load_mmeb_model(model_path, *, max_length=16384,
+                    image_min_pixels=None, image_max_pixels=None):
+    return load_model(
+        model_path, max_length=max_length,
+        default_min_pixels=MMEB_IMAGE_MIN_PIXELS,
+        default_max_pixels=MMEB_IMAGE_MAX_PIXELS,
+        image_min_pixels=image_min_pixels,
+        image_max_pixels=image_max_pixels)
 
 
 def make_item(
@@ -640,7 +469,7 @@ def main():
     logger.info(f"Image dir: {image_dir}")
 
     # Load model
-    model, model_type = load_model(
+    model, model_type = load_mmeb_model(
         args.model_path,
         max_length=args.max_length,
         image_min_pixels=args.image_min_pixels,
