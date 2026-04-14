@@ -27,6 +27,10 @@ Directory structure (under --video_dir, default: datasets/mmeb_cache/video-tasks
     produced by the Qwen3-VL-Embedding extraction scripts.
 
 Usage:
+    # Pre-download HF datasets (one-time, avoids mid-eval hangs)
+    python eval/run_mmeb_video.py --download_datasets
+    python eval/run_mmeb_video.py --download_datasets --tasks HMDB51 MSR-VTT
+
     # Quick eval: 1 task per category (~HMDB51, MSR-VTT, NExTQA, QVHighlight)
     python eval/run_mmeb_video.py --model_path models/checkpoints/Qwen3-VL-Embedding-2B \\
         --video_dir datasets/mmeb_cache/video-tasks --quick
@@ -43,6 +47,7 @@ Usage:
 """
 
 import argparse
+import importlib
 import json
 import logging
 import os
@@ -51,13 +56,19 @@ import shutil
 import sys
 from pathlib import Path
 
+# Must be set before any huggingface_hub / datasets import to prevent hf_xet
+# from being loaded.  hf_xet uses chunked S3 range requests that stall
+# indefinitely with no timeout on this network.
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+
 import numpy as np
 import torch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 from eval.eval_utils import attach_run_log, load_model, embed_batch
 
 # ---------------------------------------------------------------------------
@@ -120,7 +131,7 @@ VIDEO_TASKS = {
         "instruction": "Recognize the category of the video content.",
     },
     "SmthSmthV2": {
-        "category": "video_cls", "eval_type": "global",
+        "category": "video_cls", "eval_type": "local",
         "video_subdir": "video_cls/SSv2",
         "instruction": "What actions or object interactions are being performed by the person in the video?",
     },
@@ -408,6 +419,24 @@ def _load_hf_mvbench():
     return concatenate_datasets(parts)
 
 
+def download_datasets(tasks):
+    """Pre-download HF datasets so eval doesn't hang on network I/O."""
+    from datasets import load_dataset
+
+    for task_name in tasks:
+        logger.info("Downloading %s ...", task_name)
+        if task_name == "MVBench":
+            repo, _, split = HF_DATASETS["MVBench"]
+            for subset_name in MVBENCH_SUBSET_META:
+                logger.info("  MVBench/%s", subset_name)
+                load_dataset(repo, subset_name, split=split)
+        else:
+            repo, subset, split = HF_DATASETS[task_name]
+            load_dataset(repo, subset, split=split)
+        logger.info("  OK: %s", task_name)
+    logger.info("All %d dataset(s) cached.", len(tasks))
+
+
 # ---------------------------------------------------------------------------
 # Data loading -- Video Classification (global eval)
 # ---------------------------------------------------------------------------
@@ -428,8 +457,9 @@ def load_video_cls_data(task_name, video_dir, num_frames, max_frames_saved):
     queries, gt_indices = [], []
     skipped = 0
     for ex in ds:
-        vid_id = ex["video_id"]
-        vpath = os.path.join(video_dir, "videos", subdir, vid_id + ".mp4")
+        vid_id = str(ex["video_id"])
+        vid_file = ex.get("video_path", vid_id + ".mp4")
+        vpath = os.path.join(video_dir, "videos", subdir, vid_file)
         fdir = os.path.join(video_dir, "frames", subdir, vid_id)
         ensure_frames(vpath, fdir, max_frames_saved)
         fps = process_video_frames(fdir, num_frames)
@@ -446,6 +476,45 @@ def load_video_cls_data(task_name, video_dir, num_frames, max_frames_saved):
     return queries, corpus, gt_indices
 
 
+def load_video_cls_mc_data(task_name, video_dir, num_frames, max_frames_saved):
+    """SSV2-style local MC classification: each query has its own candidate set."""
+    ds = _load_hf(task_name)
+    info = VIDEO_TASKS[task_name]
+    subdir = info["video_subdir"]
+    instruction = info["instruction"]
+
+    queries, per_query_cands, answer_indices = [], [], []
+    skipped = 0
+    for ex in ds:
+        vid_id = str(ex["video_id"])
+        vid_file = ex.get("video_path", vid_id + ".mp4")
+        vpath = os.path.join(video_dir, "videos", subdir, vid_file)
+        fdir = os.path.join(video_dir, "frames", subdir, vid_id)
+        ensure_frames(vpath, fdir, max_frames_saved)
+        fps = process_video_frames(fdir, num_frames)
+        if not fps:
+            skipped += 1
+            continue
+
+        pos_text = ex["pos_text"]
+        neg_texts = ex["neg_text"]
+        cands = [{"text": t} for t in neg_texts]
+        ans_idx = next((i for i, t in enumerate(neg_texts) if t == pos_text), -1)
+        if ans_idx < 0:
+            cands.insert(0, {"text": pos_text})
+            ans_idx = 0
+
+        queries.append({"video": fps, "instruction": instruction})
+        per_query_cands.append(cands)
+        answer_indices.append(ans_idx)
+
+    if skipped:
+        logger.warning("%s: %d videos with missing frames", task_name, skipped)
+    logger.info("  %d queries, %d candidates/query (local MC)",
+                len(queries), len(per_query_cands[0]) if per_query_cands else 0)
+    return queries, per_query_cands, answer_indices
+
+
 # ---------------------------------------------------------------------------
 # Data loading -- Video Retrieval (global eval)
 # ---------------------------------------------------------------------------
@@ -455,9 +524,9 @@ def _normalize_ret_row(task_name, ex):
     if task_name == "MSR-VTT":
         return ex["video_id"], ex["video"], ex["caption"]
     if task_name == "MSVD":
-        return ex["video_id"], ex["video"], ex["captions"][0]
+        return ex["video_id"], ex["video"], ex["caption"][0]
     if task_name == "DiDeMo":
-        vfile = ex["video_path"]
+        vfile = ex["video"]
         return os.path.splitext(os.path.basename(vfile))[0], os.path.basename(vfile), ex["caption"]
     if task_name == "YouCook2":
         return ex["id"], os.path.basename(ex["video_path"]), ex["sentence"]
@@ -677,9 +746,9 @@ def _load_moment_retrieval_data(task_name, video_dir, num_frames, max_frames_sav
             for ci, cname in enumerate(clip_dirs):
                 cfps = process_video_frames(os.path.join(frames_dir, cname), n_clip_frames)
                 if cfps:
-                    cands.append({"video": cfps})
                     if cname.startswith("positive"):
-                        pos_idx = ci
+                        pos_idx = len(cands)
+                    cands.append({"video": cfps})
 
         if not cands or pos_idx < 0:
             skipped += 1
@@ -865,6 +934,9 @@ def evaluate_task(model, task_name, video_dir, batch_size, num_frames, max_frame
     logger.info("--- %s (category=%s) ---", task_name, cat)
 
     if cat == "video_cls":
+        if VIDEO_TASKS[task_name]["eval_type"] == "local":
+            q, pqc, ai = load_video_cls_mc_data(task_name, video_dir, num_frames, max_frames_saved)
+            return evaluate_local(model, task_name, q, pqc, ai, batch_size)
         q, c, gt = load_video_cls_data(task_name, video_dir, num_frames, max_frames_saved)
         return evaluate_global(model, task_name, q, c, gt, batch_size)
 
@@ -908,6 +980,8 @@ def main():
                         help="Max frames to extract per video (default 64)")
     parser.add_argument("--image_min_pixels", type=int, default=None)
     parser.add_argument("--image_max_pixels", type=int, default=None)
+    parser.add_argument("--download_datasets", action="store_true",
+                        help="Pre-download HF datasets for selected tasks, then exit")
     parser.add_argument("--list_tasks", action="store_true")
     args = parser.parse_args()
 
@@ -924,6 +998,21 @@ def main():
                 print(f"  {t:20s}  eval={ti['eval_type']:6s}  HF={HF_DATASETS[t][0]}")
         print(f"\nTotal: {len(ALL_TASKS)} video tasks")
         print(f"Quick subset: {QUICK_TASKS}")
+        return
+
+    # --- resolve task list early (shared by --download_datasets and eval) ---
+    if args.tasks:
+        tasks = args.tasks
+    elif args.full:
+        tasks = ALL_TASKS
+    elif args.quick:
+        tasks = QUICK_TASKS
+    else:
+        tasks = QUICK_TASKS
+
+    # --- download only ---
+    if args.download_datasets:
+        download_datasets(tasks)
         return
 
     # --- eval ---
@@ -947,17 +1036,6 @@ def main():
     logger.info("CUDA_VISIBLE_DEVICES=%s", os.environ.get("CUDA_VISIBLE_DEVICES", "(not set)"))
     if torch.cuda.is_available():
         logger.info("CUDA device: %s", torch.cuda.get_device_name(0))
-
-    # Task list
-    if args.tasks:
-        tasks = args.tasks
-    elif args.quick:
-        tasks = QUICK_TASKS
-    elif args.full:
-        tasks = ALL_TASKS
-    else:
-        tasks = QUICK_TASKS
-        logger.info("No --tasks/--quick/--full specified, defaulting to --quick")
 
     logger.info("Running %d task(s)", len(tasks))
     logger.info("Video dir: %s", args.video_dir)

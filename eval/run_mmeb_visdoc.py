@@ -21,6 +21,10 @@ Directory structure (under --visdoc_dir, default: datasets/mmeb_cache/visdoc-tas
         ...
 
 Usage:
+    # Pre-download HF datasets (one-time, avoids mid-eval hangs)
+    python eval/run_mmeb_visdoc.py --download_datasets
+    python eval/run_mmeb_visdoc.py --download_datasets --tasks ViDoRe_arxivqa VisRAG_ChartQA
+
     # Quick eval: 1 task per sub-benchmark
     python eval/run_mmeb_visdoc.py --model_path models/checkpoints/Qwen3-VL-Embedding-2B --quick
 
@@ -42,6 +46,14 @@ import logging
 import os
 import sys
 from pathlib import Path
+
+# Must be set before any huggingface_hub / datasets import to prevent hf_xet
+# from being loaded.  hf_xet uses chunked S3 range requests that stall
+# indefinitely with no timeout on this network.
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 import numpy as np
 import torch
@@ -219,20 +231,72 @@ def load_visdoc_model(model_path, *, max_length=16384,
 # BEIR data loading
 # ---------------------------------------------------------------------------
 
-def _load_beir_splits(task_name):
-    """Load queries, corpus, and qrels from a BEIR-format HuggingFace dataset."""
+def _load_beir_splits(task_name, skip_corpus=False):
+    """Load queries, corpus, and qrels from a BEIR-format HuggingFace dataset.
+
+    When skip_corpus=True, returns None for corpus (used when images are
+    already on disk to avoid downloading the large corpus parquet).
+    """
     from datasets import load_dataset
 
     repo, lang, split = HF_DATASETS[task_name]
     queries = load_dataset(repo, "queries", split=split)
-    corpus = load_dataset(repo, "corpus", split=split)
+    corpus = None if skip_corpus else load_dataset(repo, "corpus", split=split)
     qrels = load_dataset(repo, "qrels", split=split)
 
-    # Language filter (ViDoRe v2 multilingual datasets)
     if lang is not None:
         queries = queries.filter(lambda ex: ex.get("language") == lang)
 
     return queries, corpus, qrels
+
+
+def _stream_corpus_ids(task_name):
+    """Get corpus IDs without downloading full image data.
+
+    Downloads just the parquet metadata via hf_hub_download (which has retries)
+    and reads only the corpus-id column with pyarrow.
+    """
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfApi
+
+    repo, _, split = HF_DATASETS[task_name]
+    api = HfApi()
+    files = api.list_repo_files(repo, repo_type="dataset")
+    parquets = sorted(f for f in files if f.startswith(f"corpus/{split}") and f.endswith(".parquet"))
+    if not parquets:
+        parquets = sorted(f for f in files if "corpus" in f and f.endswith(".parquet"))
+
+    ids = []
+    for pf in parquets:
+        local = api.hf_hub_download(repo, pf, repo_type="dataset")
+        table = pq.read_table(local, columns=["corpus-id"])
+        ids.extend(table["corpus-id"].to_pylist())
+    return ids
+
+
+def download_datasets(tasks, visdoc_dir):
+    """Pre-download HF datasets so eval doesn't hang on network I/O.
+
+    Downloads queries and qrels for every task.  Corpus (large, contains images)
+    is only downloaded when images are not already saved to disk.
+    """
+    from datasets import load_dataset
+
+    for task_name in tasks:
+        logger.info("Downloading %s ...", task_name)
+        repo, lang, split = HF_DATASETS[task_name]
+        load_dataset(repo, "queries", split=split)
+        load_dataset(repo, "qrels", split=split)
+        image_root = os.path.join(visdoc_dir, "images", task_name)
+        has_images = os.path.isdir(image_root) and any(
+            f.endswith((".png", ".jpg", ".jpeg")) for f in os.listdir(image_root)
+        )
+        if has_images:
+            logger.info("  OK: %s (queries+qrels cached, images on disk)", task_name)
+        else:
+            load_dataset(repo, "corpus", split=split)
+            logger.info("  OK: %s (queries+qrels+corpus cached)", task_name)
+    logger.info("All %d dataset(s) cached.", len(tasks))
 
 
 def _save_corpus_images(task_name, corpus_dataset, image_root):
@@ -255,32 +319,50 @@ def _save_corpus_images(task_name, corpus_dataset, image_root):
         logger.warning("  %d corpus rows had no image data", skipped)
 
 
+def _has_images_on_disk(image_root):
+    """Check whether corpus images have already been saved to disk."""
+    if not os.path.isdir(image_root):
+        return False
+    return any(f.endswith((".png", ".jpg", ".jpeg")) for f in os.listdir(image_root))
+
+
 def load_visdoc_data(task_name, visdoc_dir):
-    """Load one VisDoc task.
+    """Load one VisDoc task (global retrieval, matching reference visdoc.yaml eval_type: global).
 
     Returns
     -------
     query_items : list[dict]
-        Items for model.process()  (text + instruction).
     corpus_items : list[dict]
-        Items for model.process()  (image path).
-    corpus_ids : list[str]
-        Corpus ID parallel to corpus_items.
+    corpus_ids : list
     query_qrels : list[dict]
-        Per-query relevance dict  {corpus_id: score}.
     """
-    queries_ds, corpus_ds, qrels_ds = _load_beir_splits(task_name)
+    image_root = os.path.join(visdoc_dir, "images", task_name)
+    images_on_disk = _has_images_on_disk(image_root)
+
+    if not images_on_disk:
+        queries_ds, corpus_ds, qrels_ds = _load_beir_splits(task_name)
+        _save_corpus_images(task_name, corpus_ds, image_root)
+        all_cids = [row["corpus-id"] for row in corpus_ds]
+    else:
+        queries_ds, _, qrels_ds = _load_beir_splits(task_name, skip_corpus=True)
+        if VISDOC_TASKS[task_name]["parser"] == "visrag":
+            all_cids = _stream_corpus_ids(task_name)
+        else:
+            # Vidore tasks: filenames are {corpus_id}.png, IDs are ints in qrels
+            all_cids = []
+            for fname in sorted(os.listdir(image_root)):
+                if fname.endswith((".png", ".jpg", ".jpeg")):
+                    raw = os.path.splitext(fname)[0]
+                    try:
+                        all_cids.append(int(raw))
+                    except ValueError:
+                        all_cids.append(raw)
+
     qrels_mapping = load_qrels_mapping(qrels_ds)
 
-    # Save corpus images to disk
-    image_root = os.path.join(visdoc_dir, "images", task_name)
-    _save_corpus_images(task_name, corpus_ds, image_root)
-
-    # Build corpus items (one per document page)
     corpus_items = []
     corpus_ids = []
-    for row in corpus_ds:
-        cid = row["corpus-id"]
+    for cid in all_cids:
         img_path = _corpus_image_path(task_name, image_root, cid)
         if os.path.exists(img_path):
             corpus_items.append({
@@ -290,7 +372,6 @@ def load_visdoc_data(task_name, visdoc_dir):
             })
             corpus_ids.append(cid)
 
-    # Build query items (only queries that have qrels entries)
     query_items = []
     query_qrels = []
     skipped = 0
@@ -336,11 +417,9 @@ def evaluate_task(model, task_name, visdoc_dir, batch_size):
     logger.info("  Embedding %d corpus images ...", n_c)
     corpus_embs = embed_batch(model, corpus_items, batch_size)
 
-    # Full similarity matrix  [N_q, N_c]
     sims = qry_embs @ corpus_embs.T
     ranked_indices = sims.argsort(dim=1, descending=True).cpu().numpy()
 
-    # Compute per-query metrics
     hits1, ndcgs5, recalls5 = [], [], []
     for i in range(n_q):
         ranked = [corpus_ids[j] for j in ranked_indices[i]]
@@ -386,6 +465,8 @@ def main():
     parser.add_argument("--max_length", type=int, default=16384)
     parser.add_argument("--image_min_pixels", type=int, default=None)
     parser.add_argument("--image_max_pixels", type=int, default=None)
+    parser.add_argument("--download_datasets", action="store_true",
+                        help="Pre-download HF datasets for selected tasks, then exit")
     parser.add_argument("--list_tasks", action="store_true")
     args = parser.parse_args()
 
@@ -406,6 +487,21 @@ def main():
         print(f"Quick subset: {QUICK_TASKS}")
         return
 
+    # --- resolve task list early (shared by --download_datasets and eval) ---
+    if args.tasks:
+        tasks = args.tasks
+    elif args.full:
+        tasks = ALL_TASKS
+    elif args.quick:
+        tasks = QUICK_TASKS
+    else:
+        tasks = QUICK_TASKS
+
+    # --- download only ---
+    if args.download_datasets:
+        download_datasets(tasks, args.visdoc_dir)
+        return
+
     # --- eval ---
     if not args.model_path:
         parser.error("--model_path is required for evaluation")
@@ -423,16 +519,6 @@ def main():
     logger.info("CUDA_VISIBLE_DEVICES=%s", os.environ.get("CUDA_VISIBLE_DEVICES", "(not set)"))
     if torch.cuda.is_available():
         logger.info("CUDA device: %s", torch.cuda.get_device_name(0))
-
-    if args.tasks:
-        tasks = args.tasks
-    elif args.quick:
-        tasks = QUICK_TASKS
-    elif args.full:
-        tasks = ALL_TASKS
-    else:
-        tasks = QUICK_TASKS
-        logger.info("No --tasks/--quick/--full specified, defaulting to --quick")
 
     logger.info("Running %d task(s)", len(tasks))
     logger.info("VisDoc dir: %s", args.visdoc_dir)
