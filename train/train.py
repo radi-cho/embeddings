@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Multimodal contrastive pretraining for Qwen3.5 / Qwen3-VL embedding models.
 
-Cross-GPU contrastive training with GradCache:
-  contrastive_batch_size = total in-batch negatives (gathered across GPUs)
-  per_device_batch       = contrastive_batch_size / num_gpus  (auto)
-  micro_batch_size       = forward pass chunk size (GPU memory limit)
-  GradCache enables when per_device_batch > micro_batch_size (auto)
+Simple DDP training with cross-GPU embedding gathering for contrastive loss.
+Each GPU encodes its local batch, embeddings are gathered across GPUs via
+GatherWithGrad so the loss sees (batch_size * num_gpus) in-batch negatives,
+then loss.backward() flows gradients back through DDP normally.
+
+No GradCache -- batch_size must fit in GPU memory. Scale effective batch
+by adding GPUs (batch_size * num_gpus) or gradient_accumulation_steps.
 """
 
 import argparse
@@ -28,7 +30,7 @@ from transformers import get_cosine_schedule_with_warmup
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from train.dataset import build_dataloader, build_mixed_dataloader
+from train.dataset import build_dataloader, build_mixed_dataloader, collate_embedding_batch
 from train.losses import (
     cosent_loss, masked_infonce_loss, mrl_cosent_loss, mrl_infonce_loss,
 )
@@ -43,10 +45,6 @@ LORA_TARGETS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Distributed helpers
-# ---------------------------------------------------------------------------
-
 def _world():
     return dist.get_world_size() if dist.is_initialized() else 1
 
@@ -55,7 +53,7 @@ def _rank():
 
 
 class GatherWithGrad(torch.autograd.Function):
-    """all_gather with gradient passthrough for the local shard."""
+    """all_gather that lets gradients flow back through the local shard."""
     @staticmethod
     def forward(ctx, x):
         if _world() == 1:
@@ -69,26 +67,11 @@ class GatherWithGrad(torch.autograd.Function):
     def backward(ctx, grad):
         if _world() == 1:
             return grad
-        c = grad.shape[0] // _world()
-        return grad[_rank() * c : (_rank() + 1) * c]
-
-
-def _gather(emb):
-    if emb is None or _world() == 1:
-        return emb
-    return GatherWithGrad.apply(emb)
-
-
-def _gather_detached(t):
-    if t is None or _world() == 1:
-        return t
-    gathered = [torch.zeros_like(t) for _ in range(_world())]
-    dist.all_gather(gathered, t.contiguous())
-    return torch.cat(gathered, dim=0)
+        chunk = grad.shape[0] // _world()
+        return grad[_rank() * chunk : (_rank() + 1) * chunk]
 
 
 def _gather_metadata(task_types, scores):
-    """Gather task_types (list[str]) and scores (tensor|None) across GPUs."""
     if _world() == 1:
         return task_types, scores
     all_tt = [None] * _world()
@@ -101,86 +84,50 @@ def _gather_metadata(task_types, scores):
     return g_tt, None
 
 
-# ---------------------------------------------------------------------------
-# Encoding
-# ---------------------------------------------------------------------------
-
 def _format_item(embedder, e):
     return embedder.format_model_input(
         text=e.get("text"), image=e.get("image"),
         video=e.get("video"), instruction=e.get("instruction"))
 
 
+def _format_text_only(embedder, e):
+    return embedder.format_model_input(
+        text=e.get("text") or "NULL", instruction=e.get("instruction"))
+
+
 def _encode(model, embedder, items, device):
-    """Encode a list of items → (B, D) pooled embeddings. OOM-safe."""
+    """Encode a batch. On vision preprocessing failure, retry as text-only.
+    OOM and timeouts are not caught — they propagate to fail the step."""
     if not items:
         return None
     convs = [_format_item(embedder, e) for e in items]
     try:
         proc = embedder._preprocess_inputs(convs)
-    except Exception:
-        convs = [embedder.format_model_input(
-            text=e.get("text") or "NULL", instruction=e.get("instruction"))
-            for e in items]
+    except Exception as exc:
+        logger.warning("Vision preprocess failed (%s), text-only fallback for batch", exc)
+        convs = [_format_text_only(embedder, e) for e in items]
         proc = embedder._preprocess_inputs(convs)
     proc = {k: v.to(device) for k, v in proc.items() if torch.is_tensor(v)}
-    try:
-        out = model(**proc)
-        return embedder._pooling_last(out.last_hidden_state, proc["attention_mask"])
-    except torch.cuda.OutOfMemoryError:
-        torch.cuda.empty_cache()
-        embs = []
-        for e in items:
-            try:
-                p = embedder._preprocess_inputs([_format_item(embedder, e)])
-            except Exception:
-                p = embedder._preprocess_inputs([embedder.format_model_input(
-                    text=e.get("text") or "NULL", instruction=e.get("instruction"))])
-            p = {k: v.to(device) for k, v in p.items() if torch.is_tensor(v)}
-            out = model(**p)
-            embs.append(embedder._pooling_last(out.last_hidden_state, p["attention_mask"]))
-        return torch.cat(embs, dim=0)
+    out = model(**proc)
+    return embedder._pooling_last(out.last_hidden_state, proc["attention_mask"])
 
 
-def _filter_negatives(negatives):
-    """Extract genuine hard negatives, dropping None placeholders."""
-    if negatives is None:
-        return []
-    return [n for n in negatives if n is not None]
-
-
-def _chunked(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i + n]
-
-
-# ---------------------------------------------------------------------------
-# Loss
-# ---------------------------------------------------------------------------
-
-def _compute_loss(q_emb, p_emb, n_emb, task_types, scores, args):
-    """Route by task_type: contrastive items → InfoNCE, STS items → CoSent."""
+def _compute_loss(q_emb, p_emb, task_types, scores, args):
     mrl = args.mrl_dims if args.use_mrl else None
     device = q_emb.device
-
     sts_idx = [i for i, t in enumerate(task_types) if t == "sts"]
     con_idx = [i for i, t in enumerate(task_types) if t != "sts"]
     losses = []
-
     if con_idx:
         ci = torch.tensor(con_idx, device=device)
         q, p = q_emb[ci], p_emb[ci]
-        n = n_emb[ci] if n_emb is not None and n_emb.shape[0] == q_emb.shape[0] else None
         if mrl:
-            losses.append(mrl_infonce_loss(q, p, n, mrl_dims=mrl,
+            losses.append(mrl_infonce_loss(q, p, None, mrl_dims=mrl,
                           temperature=args.temperature, stage=args.training_stage))
         else:
-            hn = n if (n is not None and n.shape[0] > 0) else None
             losses.append(masked_infonce_loss(
-                F.normalize(q, dim=-1), F.normalize(p, dim=-1),
-                F.normalize(hn, dim=-1) if hn is not None else None,
+                F.normalize(q, dim=-1), F.normalize(p, dim=-1), None,
                 temperature=args.temperature, stage=args.training_stage))
-
     if sts_idx and scores is not None:
         si = torch.tensor(sts_idx, device=device)
         q, p, s = q_emb[si], p_emb[si], scores[si]
@@ -190,92 +137,24 @@ def _compute_loss(q_emb, p_emb, n_emb, task_types, scores, args):
         else:
             losses.append(cosent_loss(F.normalize(q, dim=-1),
                           F.normalize(p, dim=-1), s, temperature=args.temperature))
-
     if not losses:
         return torch.tensor(0.0, device=device, requires_grad=True)
     return sum(losses) / len(losses)
 
 
-# ---------------------------------------------------------------------------
-# Training steps
-# ---------------------------------------------------------------------------
-
-def _simple_step(embedder, model, device, batch, args):
-    """Forward+backward with cross-GPU embedding gathering."""
-    q = _encode(model, embedder, batch["queries"], device)
-    p = _encode(model, embedder, batch["positives"], device)
-    negs = _filter_negatives(batch["negatives"])
-    n = _encode(model, embedder, negs, device) if negs else None
-
-    q, p, n = _gather(q), _gather(p), _gather(n)
+def _train_step(embedder, raw_model, device, batch, args):
+    q_local = _encode(raw_model, embedder, batch["queries"], device)
+    p_local = _encode(raw_model, embedder, batch["positives"], device)
+    if _world() > 1:
+        dist.barrier()
+    q = GatherWithGrad.apply(q_local) if _world() > 1 else q_local
+    p = GatherWithGrad.apply(p_local) if _world() > 1 else p_local
     scores = batch["scores"].to(device) if batch["scores"] is not None else None
     g_tt, g_scores = _gather_metadata(batch["task_types"], scores)
-
-    loss = _compute_loss(q, p, n, g_tt, g_scores, args)
+    loss = _compute_loss(q, p, g_tt, g_scores, args)
     loss.backward()
     return loss.detach().float().item()
 
-
-def _gradcache_step(embedder, model, raw_model, device, batch, micro_bs, args):
-    """GradCache: encode locally → gather globally → loss → replay grads."""
-
-    def _cache_role(items):
-        if not items:
-            return None
-        parts = []
-        for chunk in _chunked(items, micro_bs):
-            with torch.no_grad():
-                parts.append(_encode(raw_model, embedder, chunk, device))
-        return torch.cat(parts, dim=0)
-
-    local_q = _cache_role(batch["queries"])
-    local_p = _cache_role(batch["positives"])
-    negs = _filter_negatives(batch["negatives"])
-    local_n = _cache_role(negs) if negs else None
-    local_bs = local_q.shape[0]
-
-    global_q = _gather_detached(local_q).detach().requires_grad_(True)
-    global_p = _gather_detached(local_p).detach().requires_grad_(True)
-    global_n = None
-    if local_n is not None:
-        global_n = _gather_detached(local_n).detach().requires_grad_(True)
-
-    scores = batch["scores"].to(device) if batch["scores"] is not None else None
-    g_tt, g_scores = _gather_metadata(batch["task_types"], scores)
-
-    loss = _compute_loss(global_q, global_p, global_n, g_tt, g_scores, args)
-
-    targets = [global_q, global_p] + ([global_n] if global_n is not None else [])
-    grads = torch.autograd.grad(loss, targets)
-
-    rank = _rank()
-    q_grad = grads[0][rank * local_bs : (rank + 1) * local_bs]
-    p_grad = grads[1][rank * local_bs : (rank + 1) * local_bs]
-    n_grad = None
-    if local_n is not None:
-        ln = local_n.shape[0]
-        n_grad = grads[2][rank * ln : (rank + 1) * ln]
-
-    roles = [(batch["queries"], q_grad), (batch["positives"], p_grad)]
-    if negs:
-        roles.append((negs, n_grad))
-
-    for items, grad in roles:
-        if items is None or grad is None:
-            continue
-        offset = 0
-        for chunk in _chunked(items, micro_bs):
-            cg = grad[offset:offset + len(chunk)]
-            emb = _encode(model, embedder, chunk, device)
-            emb.backward(cg)
-            offset += len(chunk)
-
-    return loss.detach().float().item()
-
-
-# ---------------------------------------------------------------------------
-# Model setup
-# ---------------------------------------------------------------------------
 
 def _detect_model_type(model_path):
     cfg = Path(model_path) / "config.json"
@@ -311,11 +190,10 @@ def _save_ckpt(accelerator, embedder, args, step, final=False):
         tok.save_pretrained(d)
 
 
-def _build_dataloader(args, embedder, per_device_batch):
+def _build_dataloader(args, embedder, batch_size):
     subsets = args.subsets.split(",") if args.subsets else None
     tt_filter = args.task_types.split(",") if args.task_types else None
-    kw = dict(batch_size=per_device_batch, num_workers=args.num_workers, shuffle=True)
-
+    kw = dict(batch_size=batch_size, num_workers=args.num_workers, shuffle=True)
     if args.data_dir:
         return build_mixed_dataloader(
             data_dir=args.data_dir, image_dir=args.image_dir,
@@ -328,24 +206,18 @@ def _build_dataloader(args, embedder, per_device_batch):
         cache_dir=args.cache_dir, **kw)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def train(args):
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         log_with="wandb" if args.use_wandb else None,
         mixed_precision="bf16",
-        kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(minutes=10))])
+        kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(minutes=60))])
 
     set_seed(args.seed)
-
     if accelerator.is_main_process:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         with open(Path(args.output_dir) / "training_args.json", "w") as f:
             json.dump(vars(args), f, indent=2, default=str)
-
     if args.use_wandb and accelerator.is_main_process:
         wkw = {"name": args.wandb_run_name or None}
         wp = args.wandb_project
@@ -356,7 +228,6 @@ def train(args):
         accelerator.init_trackers(project_name=wp, config=vars(args),
                                   init_kwargs={"wandb": wkw})
 
-    # Model + LoRA
     mt = _detect_model_type(args.model_path)
     accelerator.print(f"Loading {args.model_path} (type={mt})")
     embedder = _load_embedder(args.model_path, args.max_length, mt, args.max_pixels)
@@ -370,60 +241,55 @@ def train(args):
         embedder.model.enable_input_require_grads()
         embedder.model.gradient_checkpointing_enable()
 
-    # Batch math
     world = accelerator.num_processes
-    cbs = args.contrastive_batch_size
-    mbs = args.micro_batch_size
-    assert cbs % world == 0, f"contrastive_batch_size ({cbs}) must be divisible by num_gpus ({world})"
-    per_dev = cbs // world
-    use_gc = per_dev > mbs
-
+    bs = args.batch_size
+    effective_bs = bs * world * args.gradient_accumulation_steps
     accelerator.print(
-        f"\n  Contrastive BS: {cbs} ({per_dev}/GPU x {world})\n"
-        f"  Micro BS: {mbs}  |  GradCache: {'ON' if use_gc else 'OFF'}\n"
-        f"  Grad accum: {args.gradient_accumulation_steps}  |  "
-        f"Gather: {'YES' if world > 1 else 'N/A'}\n"
-        f"  Seed: {args.seed}")
+        f"\n  Batch size: {bs}/GPU x {world} GPUs"
+        f" x {args.gradient_accumulation_steps} accum = {effective_bs} effective\n"
+        f"  LR: {args.lr}  |  Epochs: {args.epochs}  |  Seed: {args.seed}")
 
-    # Data + optimizer + scheduler
-    dataloader = _build_dataloader(args, embedder, per_dev)
+    dataloader = _build_dataloader(args, embedder, bs)
     optimizer = AdamW(embedder.model.parameters(), lr=args.lr,
                       weight_decay=args.weight_decay)
-    embedder.model, optimizer, dataloader = accelerator.prepare(
-        embedder.model, optimizer, dataloader)
+    embedder.model, optimizer = accelerator.prepare(embedder.model, optimizer)
+
+    if world > 1:
+        from torch.utils.data import DistributedSampler
+        sampler = DistributedSampler(dataloader.dataset, num_replicas=world,
+                                     rank=_rank(), shuffle=True, seed=args.seed)
+        dataloader = torch.utils.data.DataLoader(
+            dataloader.dataset, batch_size=bs, sampler=sampler,
+            collate_fn=collate_embedding_batch, num_workers=args.num_workers,
+            drop_last=True, pin_memory=False)
 
     total_steps = len(dataloader) * args.epochs
     warmup = int(total_steps * args.warmup_ratio)
     scheduler = accelerator.prepare(get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup, num_training_steps=total_steps))
-    raw_model = accelerator.unwrap_model(embedder.model)
-
     accelerator.print(f"  Steps: {total_steps} ({len(dataloader)}/epoch), warmup={warmup}")
 
-    # Training loop
+    raw_model = accelerator.unwrap_model(embedder.model)
     global_step = 0
     embedder.model.train()
     for epoch in range(args.epochs):
         epoch_loss, epoch_steps, t0 = 0.0, 0, time.time()
+        if hasattr(dataloader, 'sampler') and hasattr(dataloader.sampler, 'set_epoch'):
+            dataloader.sampler.set_epoch(epoch)
         for batch in dataloader:
-            with accelerator.accumulate(embedder.model):
-                optimizer.zero_grad()
-                if use_gc:
-                    with accelerator.no_sync(embedder.model):
-                        step_loss = _gradcache_step(
-                            embedder, embedder.model, raw_model,
-                            accelerator.device, batch, mbs, args)
-                    if world > 1:
-                        for p in embedder.model.parameters():
-                            if p.grad is not None:
-                                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
-                else:
-                    step_loss = _simple_step(
-                        embedder, embedder.model, accelerator.device, batch, args)
-                torch.nn.utils.clip_grad_norm_(
-                    embedder.model.parameters(), args.max_grad_norm)
-                optimizer.step()
-                scheduler.step()
+            optimizer.zero_grad()
+            with accelerator.no_sync(embedder.model):
+                step_loss = _train_step(
+                    embedder, raw_model, accelerator.device, batch, args)
+            if world > 1:
+                dist.barrier()
+                for p in embedder.model.parameters():
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+            torch.nn.utils.clip_grad_norm_(
+                embedder.model.parameters(), args.max_grad_norm)
+            optimizer.step()
+            scheduler.step()
 
             epoch_loss += step_loss
             epoch_steps += 1
@@ -432,9 +298,9 @@ def train(args):
             if global_step % args.log_interval == 0 and accelerator.is_main_process:
                 avg = epoch_loss / epoch_steps
                 lr = scheduler.get_last_lr()[0]
-                sps = (epoch_steps * cbs) / (time.time() - t0)
-                logger.info("E%d S%d/%d | loss=%.4f lr=%.2e | %.1f samp/s cbs=%d",
-                            epoch, global_step, total_steps, avg, lr, sps, cbs)
+                sps = (epoch_steps * effective_bs) / (time.time() - t0)
+                logger.info("E%d S%d/%d | loss=%.4f lr=%.2e | %.1f samp/s bs=%d",
+                            epoch, global_step, total_steps, avg, lr, sps, effective_bs)
                 if args.use_wandb:
                     accelerator.log({"train/loss": avg, "train/lr": lr,
                                      "train/epoch": epoch, "train/step": global_step,
@@ -453,7 +319,6 @@ def train(args):
 
 def main():
     p = argparse.ArgumentParser(description="Multimodal contrastive pretraining")
-    # Model
     p.add_argument("--model_path", required=True)
     p.add_argument("--output_dir", default="outputs/qwen35-embedding-train")
     p.add_argument("--max_length", type=int, default=512)
@@ -462,7 +327,6 @@ def main():
     p.add_argument("--lora_alpha", type=int, default=32)
     p.add_argument("--lora_dropout", type=float, default=0.05)
     p.add_argument("--gradient_checkpointing", action="store_true")
-    # Data
     p.add_argument("--data_dir", default=None)
     p.add_argument("--image_dir", default=None)
     p.add_argument("--dataset_split", default="diverse_instruction")
@@ -471,9 +335,7 @@ def main():
     p.add_argument("--max_samples_per_subset", type=int, default=None)
     p.add_argument("--cache_dir", default=None)
     p.add_argument("--num_workers", type=int, default=4)
-    # Training
-    p.add_argument("--contrastive_batch_size", type=int, default=1024)
-    p.add_argument("--micro_batch_size", type=int, default=4)
+    p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--lr", type=float, default=2e-5)
@@ -481,13 +343,11 @@ def main():
     p.add_argument("--warmup_ratio", type=float, default=0.1)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=42)
-    # Loss
     p.add_argument("--temperature", type=float, default=0.02)
     p.add_argument("--training_stage", type=int, default=1, choices=[1, 2])
     p.add_argument("--use_mrl", action="store_true", default=True)
     p.add_argument("--no_mrl", action="store_true")
     p.add_argument("--mrl_dims", default="1024,256,64")
-    # Logging
     p.add_argument("--log_interval", type=int, default=1)
     p.add_argument("--save_steps", type=int, default=200)
     p.add_argument("--use_wandb", action="store_true")

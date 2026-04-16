@@ -58,14 +58,7 @@ def _load_image(path: str, image_dir: Optional[str] = None) -> Optional[Image.Im
                 return Image.open(full).convert("RGB")
             except Exception:
                 return None
-    try:
-        import requests
-        url = f"https://huggingface.co/datasets/{HF_MMEB_REPO}/resolve/main/{path}"
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        return Image.open(io.BytesIO(resp.content)).convert("RGB")
-    except Exception:
-        return None
+    return None
 
 
 def _clean_mmeb_text(text: str) -> str:
@@ -243,6 +236,8 @@ class ColPaliDataset(Dataset):
 class VideoTripletDataset(Dataset):
     """Video-text pairs from JSONL ({query_text, positive_text, video_path})."""
 
+    _FRAME_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
     def __init__(self, jsonl_path: str, video_root=None, subset_name=None, max_samples=None):
         self.subset_name = subset_name or Path(jsonl_path).parent.name
         self.video_root = video_root
@@ -252,13 +247,27 @@ class VideoTripletDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
+    @staticmethod
+    def _resolve_video(path):
+        """If path is a directory of extracted frames, return sorted frame paths.
+        Otherwise return the path as-is (video file)."""
+        if not path or not os.path.isdir(path):
+            return path or None
+        frames = sorted(
+            f.path for f in os.scandir(path)
+            if f.is_file() and os.path.splitext(f.name)[1].lower()
+            in VideoTripletDataset._FRAME_EXTS
+        )
+        return frames if frames else path
+
     def __getitem__(self, idx):
         r = self.data[idx]
         vp = r.get("video_path", "")
         if self.video_root and vp:
             vp = os.path.join(self.video_root, vp)
+        video = self._resolve_video(vp)
         return {"query": {"text": r.get("query_text"), "image": None,
-                          "video": vp or None},
+                          "video": video},
                 "positive": {"text": r.get("positive_text"), "image": None},
                 "negative": None,
                 "task_type": r.get("task_type", "retrieval"),
@@ -380,12 +389,14 @@ def build_mixed_dataloader(data_dir: str, image_dir=None,
 
     p = base / "llava_hound" / "train.jsonl"
     if p.is_file():
-        parts.append(VideoTripletDataset(str(p), subset_name="llava_hound"))
+        parts.append(VideoTripletDataset(str(p), video_root=str(base),
+                                         subset_name="llava_hound"))
 
     vr = base / "video_retrieval"
     if vr.is_dir():
         for jf in sorted(vr.glob("*.jsonl")):
-            parts.append(VideoTripletDataset(str(jf), subset_name=jf.stem))
+            parts.append(VideoTripletDataset(str(jf), video_root=str(base),
+                                             subset_name=jf.stem))
 
     if not parts:
         raise RuntimeError(f"No data under {data_dir}")
