@@ -4,9 +4,9 @@ Data sources:
 - MMEB-train (TIGER-Lab/MMEB-train): 20 subsets, VQA/classification/retrieval
 - Text triplets: MS MARCO, AllNLI, GooAQ, Quora (JSONL)
 - STS-B: sentence pairs with float scores (JSONL)
-- MegaPairs: image-text triplets with hard negatives (JSONL annotations)
+- MegaPairs: image-text pairs (JSONL annotations + local images)
 - ColPali: visual document retrieval (Arrow with embedded images)
-- Video: LLaVA-Hound, MSR-VTT (JSONL manifests)
+- Video: LLaVA-Hound (JSONL + extracted frame directories)
 """
 
 import io
@@ -14,7 +14,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 from PIL import Image
@@ -40,7 +40,8 @@ TASK_TYPE_MAP = {
 
 HF_MMEB_REPO = "TIGER-Lab/MMEB-train"
 IMAGE_PLACEHOLDER = "<|image_1|>"
-DEFAULT_EMBED_INSTRUCTION = "Represent the user's input."
+DEFAULT_INSTRUCTION = "Represent the user's input."
+FRAME_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 # ---------------------------------------------------------------------------
@@ -48,17 +49,27 @@ DEFAULT_EMBED_INSTRUCTION = "Represent the user's input."
 # ---------------------------------------------------------------------------
 
 def _load_image(path: str, image_dir: Optional[str] = None) -> Optional[Image.Image]:
-    if not path:
+    """Load an image from a local path under image_dir. Returns None if missing."""
+    if not path or not image_dir:
         return None
-    if image_dir:
-        rel = path.replace("images/", "", 1) if path.startswith("images/") else path
-        full = os.path.join(image_dir, rel)
-        if os.path.exists(full):
-            try:
-                return Image.open(full).convert("RGB")
-            except Exception:
-                return None
-    return None
+    rel = path.replace("images/", "", 1) if path.startswith("images/") else path
+    full = os.path.join(image_dir, rel)
+    try:
+        return Image.open(full).convert("RGB") if os.path.isfile(full) else None
+    except Exception:
+        return None
+
+
+def _resolve_video(path: str) -> Any:
+    """If path is a directory of frame images, return sorted frame paths.
+    Otherwise return the path as-is (treated as a video file)."""
+    if not path or not os.path.isdir(path):
+        return path or None
+    frames = sorted(
+        f.path for f in os.scandir(path)
+        if f.is_file() and os.path.splitext(f.name)[1].lower() in FRAME_EXTS
+    )
+    return frames if frames else None
 
 
 def _clean_mmeb_text(text: str) -> str:
@@ -72,16 +83,6 @@ def _infer_task_type(name: str) -> str:
     return "retrieval"
 
 
-def _filter_subsets(subsets, task_types):
-    target = list(ALL_MMEB_SUBSETS)
-    if subsets:
-        target = [s for s in target if s in subsets]
-    if task_types:
-        allowed = {s for tt in task_types for s in TASK_TYPE_MAP.get(tt, [])}
-        target = [s for s in target if s in allowed]
-    return target
-
-
 def _load_jsonl(path: str, max_samples: Optional[int] = None) -> List[Dict]:
     rows = []
     with open(path) as f:
@@ -93,13 +94,12 @@ def _load_jsonl(path: str, max_samples: Optional[int] = None) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
-# Dataset classes
+# Dataset classes — each returns {query, positive, task_type, subset_name}
+# query/positive are dicts with optional text/image/video keys.
 # ---------------------------------------------------------------------------
 
 class MMEBDataset(Dataset):
-    """Single MMEB-train subset."""
-
-    def __init__(self, subset_name: str, split="diverse_instruction",
+    def __init__(self, subset_name, split="diverse_instruction",
                  image_dir=None, max_samples=None, cache_dir=None):
         from datasets import load_dataset
         self.subset_name = subset_name
@@ -117,44 +117,33 @@ class MMEBDataset(Dataset):
 
     def __getitem__(self, idx):
         r = self.data[idx]
-        qimg = _load_image(r.get("qry_image_path", ""), self.image_dir)
-        pimg = _load_image(r.get("pos_image_path", ""), self.image_dir)
-        has_neg = bool(r.get("neg_text") or r.get("neg_image_path"))
-        nimg = _load_image(r.get("neg_image_path", ""), self.image_dir) if has_neg else None
         return {
-            "query": {"text": _clean_mmeb_text(r["qry"]) or None, "image": qimg},
-            "positive": {"text": _clean_mmeb_text(r.get("pos_text", "")) or None, "image": pimg},
-            "negative": {"text": _clean_mmeb_text(r.get("neg_text", "")) or None,
-                         "image": nimg} if has_neg else None,
-            "task_type": self.task_type,
-            "subset_name": self.subset_name,
+            "query": {"text": _clean_mmeb_text(r["qry"]) or None,
+                      "image": _load_image(r.get("qry_image_path", ""), self.image_dir)},
+            "positive": {"text": _clean_mmeb_text(r.get("pos_text", "")) or None,
+                         "image": _load_image(r.get("pos_image_path", ""), self.image_dir)},
+            "task_type": self.task_type, "subset_name": self.subset_name,
         }
 
 
 class STSDataset(Dataset):
-    """STS pairs with float scores from JSONL ({sentence1, sentence2, score})."""
-
-    def __init__(self, jsonl_path: str, subset_name="stsb"):
+    def __init__(self, jsonl_path, subset_name="stsb"):
         self.subset_name = subset_name
         self.data = [(r["sentence1"], r["sentence2"], float(r["score"]))
                      for r in _load_jsonl(jsonl_path)]
-        logger.info("STSDataset '%s': %d rows", subset_name, len(self.data))
+        logger.info("STS '%s': %d rows", subset_name, len(self.data))
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         a, b, score = self.data[idx]
-        return {"query": {"text": a, "image": None},
-                "positive": {"text": b, "image": None},
-                "negative": None, "score": score,
-                "task_type": "sts", "subset_name": self.subset_name}
+        return {"query": {"text": a}, "positive": {"text": b},
+                "score": score, "task_type": "sts", "subset_name": self.subset_name}
 
 
 class TextTripletDataset(Dataset):
-    """Text-only triplets from JSONL ({query, positive, negative?, task_type?})."""
-
-    def __init__(self, jsonl_path: str, subset_name=None, max_samples=None):
+    def __init__(self, jsonl_path, subset_name=None, max_samples=None):
         self.subset_name = subset_name or Path(jsonl_path).parent.name
         self.data = _load_jsonl(jsonl_path, max_samples)
         logger.info("TextTriplet '%s': %d rows", self.subset_name, len(self.data))
@@ -164,18 +153,13 @@ class TextTripletDataset(Dataset):
 
     def __getitem__(self, idx):
         r = self.data[idx]
-        neg = r.get("negative")
-        return {"query": {"text": r["query"], "image": None},
-                "positive": {"text": r["positive"], "image": None},
-                "negative": {"text": neg, "image": None} if neg else None,
+        return {"query": {"text": r["query"]}, "positive": {"text": r["positive"]},
                 "task_type": r.get("task_type", "retrieval"),
                 "subset_name": self.subset_name}
 
 
 class MegaPairsDataset(Dataset):
-    """MegaPairs image-text triplets (JSONL: {q_img, q_texts, t_img, hns})."""
-
-    def __init__(self, jsonl_path: str, image_dir=None, max_samples=None):
+    def __init__(self, jsonl_path, image_dir=None, max_samples=None):
         self.image_dir = image_dir
         self.data = _load_jsonl(jsonl_path, max_samples)
         logger.info("MegaPairs: %d rows", len(self.data))
@@ -183,33 +167,18 @@ class MegaPairsDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-    def _img(self, path):
-        if not path or not self.image_dir:
-            return None
-        full = os.path.join(self.image_dir, path)
-        try:
-            return Image.open(full).convert("RGB") if os.path.exists(full) else None
-        except Exception:
-            return None
-
     def __getitem__(self, idx):
         r = self.data[idx]
         texts = r.get("q_texts") or r.get("q_text") or []
-        hns = r.get("hns", [])
-        neg_path = hns[1] if len(hns) > 1 else (hns[0] if hns else "")
-        neg_img = self._img(neg_path)
-        t_img = self._img(r.get("t_img", ""))
-        q_img = self._img(r.get("q_img", ""))
+        q_img = _load_image(r.get("q_img", ""), self.image_dir)
+        t_img = _load_image(r.get("t_img", ""), self.image_dir)
         return {"query": {"text": texts[0] if texts else None, "image": q_img},
-                "positive": {"text": None, "image": t_img or q_img},
-                "negative": {"text": None, "image": neg_img} if neg_img else None,
+                "positive": {"image": t_img or q_img},
                 "task_type": "retrieval", "subset_name": "MegaPairs"}
 
 
 class ColPaliDataset(Dataset):
-    """ColPali visual document retrieval (query text + page image, Arrow)."""
-
-    def __init__(self, data_dir: str, max_samples=None):
+    def __init__(self, data_dir, max_samples=None):
         from datasets import load_from_disk
         self.data = load_from_disk(data_dir)
         if max_samples and max_samples < len(self.data):
@@ -227,18 +196,13 @@ class ColPaliDataset(Dataset):
                 img = Image.open(io.BytesIO(img)).convert("RGB")
             except Exception:
                 img = None
-        return {"query": {"text": r.get("query", ""), "image": None},
-                "positive": {"text": None, "image": img},
-                "negative": None,
+        return {"query": {"text": r.get("query", "")},
+                "positive": {"image": img},
                 "task_type": "retrieval", "subset_name": "ColPali"}
 
 
 class VideoTripletDataset(Dataset):
-    """Video-text pairs from JSONL ({query_text, positive_text, video_path})."""
-
-    _FRAME_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-
-    def __init__(self, jsonl_path: str, video_root=None, subset_name=None, max_samples=None):
+    def __init__(self, jsonl_path, video_root=None, subset_name=None, max_samples=None):
         self.subset_name = subset_name or Path(jsonl_path).parent.name
         self.video_root = video_root
         self.data = _load_jsonl(jsonl_path, max_samples)
@@ -247,29 +211,13 @@ class VideoTripletDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-    @staticmethod
-    def _resolve_video(path):
-        """If path is a directory of extracted frames, return sorted frame paths.
-        Otherwise return the path as-is (video file)."""
-        if not path or not os.path.isdir(path):
-            return path or None
-        frames = sorted(
-            f.path for f in os.scandir(path)
-            if f.is_file() and os.path.splitext(f.name)[1].lower()
-            in VideoTripletDataset._FRAME_EXTS
-        )
-        return frames if frames else path
-
     def __getitem__(self, idx):
         r = self.data[idx]
         vp = r.get("video_path", "")
         if self.video_root and vp:
             vp = os.path.join(self.video_root, vp)
-        video = self._resolve_video(vp)
-        return {"query": {"text": r.get("query_text"), "image": None,
-                          "video": video},
-                "positive": {"text": r.get("positive_text"), "image": None},
-                "negative": None,
+        return {"query": {"text": r.get("query_text"), "video": _resolve_video(vp)},
+                "positive": {"text": r.get("positive_text")},
                 "task_type": r.get("task_type", "retrieval"),
                 "subset_name": self.subset_name}
 
@@ -279,36 +227,19 @@ class VideoTripletDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 def collate_embedding_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Collate items into {queries, positives, negatives, task_types, scores}.
-
-    Items without hard negatives get None (no fake placeholders).
-    """
-    queries, positives, negatives, task_types, scores = [], [], [], [], []
+    queries, positives, task_types, scores = [], [], [], []
     has_scores = any("score" in item for item in batch)
-    has_neg = False
-    inst = DEFAULT_EMBED_INSTRUCTION
 
     for item in batch:
-        for role, src in [("queries", "query"), ("positives", "positive")]:
-            d = item[src]
-            (queries if role == "queries" else positives).append({
-                "text": d.get("text"), "image": d.get("image"),
-                "video": d.get("video"), "instruction": inst})
-
-        neg = item.get("negative")
-        if neg is not None:
-            negatives.append({"text": neg.get("text"), "image": neg.get("image"),
-                              "video": neg.get("video"), "instruction": inst})
-            has_neg = True
-        else:
-            negatives.append(None)
-
+        for lst, key in [(queries, "query"), (positives, "positive")]:
+            d = item[key]
+            lst.append({"text": d.get("text"), "image": d.get("image"),
+                        "video": d.get("video"), "instruction": DEFAULT_INSTRUCTION})
         task_types.append(item["task_type"])
         if has_scores:
             scores.append(item.get("score", 0.0))
 
     return {"queries": queries, "positives": positives,
-            "negatives": negatives if has_neg else None,
             "task_types": task_types,
             "scores": torch.tensor(scores, dtype=torch.float32) if scores else None}
 
@@ -319,7 +250,12 @@ def collate_embedding_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def build_mmeb_dataset(subsets=None, task_types=None, split="diverse_instruction",
                        image_dir=None, max_samples_per_subset=None, cache_dir=None):
-    target = _filter_subsets(subsets, task_types)
+    target = list(ALL_MMEB_SUBSETS)
+    if subsets:
+        target = [s for s in target if s in subsets]
+    if task_types:
+        allowed = {s for tt in task_types for s in TASK_TYPE_MAP.get(tt, [])}
+        target = [s for s in target if s in allowed]
     logger.info("Loading %d MMEB subsets", len(target))
     parts = []
     for i, name in enumerate(target):
@@ -336,25 +272,20 @@ def build_mmeb_dataset(subsets=None, task_types=None, split="diverse_instruction
     return combined
 
 
-def _make_dataloader(dataset, batch_size, num_workers, shuffle):
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
-                      collate_fn=collate_embedding_batch,
-                      num_workers=num_workers, drop_last=True, pin_memory=False)
-
-
 def build_dataloader(subsets=None, task_types=None, split="diverse_instruction",
                      image_dir=None, max_samples_per_subset=None, cache_dir=None,
                      batch_size=4, num_workers=0, shuffle=True):
     ds = build_mmeb_dataset(subsets, task_types, split, image_dir,
                             max_samples_per_subset, cache_dir)
-    return _make_dataloader(ds, batch_size, num_workers, shuffle)
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                      collate_fn=collate_embedding_batch,
+                      num_workers=num_workers, drop_last=True, pin_memory=False)
 
 
-def build_mixed_dataloader(data_dir: str, image_dir=None,
-                           mmeb_split="diverse_instruction",
-                           max_samples_per_subset=None, cache_dir=None,
-                           batch_size=4, num_workers=0, shuffle=True):
-    """ConcatDataset from all sources under data_dir + MMEB from HF."""
+def build_mixed_dataset(data_dir, image_dir=None, megapairs_image_dir=None,
+                        mmeb_split="diverse_instruction",
+                        max_samples_per_subset=None, cache_dir=None):
+    """Build a ConcatDataset from all sources under data_dir + MMEB from HF."""
     base = Path(data_dir)
     parts: List[Dataset] = []
 
@@ -376,7 +307,8 @@ def build_mixed_dataloader(data_dir: str, image_dir=None,
     p = base / "megapairs" / "train.jsonl"
     if p.is_file():
         try:
-            parts.append(MegaPairsDataset(str(p), image_dir, max_samples_per_subset))
+            parts.append(MegaPairsDataset(str(p), megapairs_image_dir or image_dir,
+                                          max_samples_per_subset))
         except Exception as e:
             logger.error("MegaPairs: %s", e)
 
@@ -387,10 +319,10 @@ def build_mixed_dataloader(data_dir: str, image_dir=None,
         except Exception as e:
             logger.error("ColPali: %s", e)
 
-    p = base / "llava_hound" / "train.jsonl"
-    if p.is_file():
-        parts.append(VideoTripletDataset(str(p), video_root=str(base),
-                                         subset_name="llava_hound"))
+    for name, jpath in [("llava_hound", base / "llava_hound" / "train.jsonl")]:
+        if jpath.is_file():
+            parts.append(VideoTripletDataset(str(jpath), video_root=str(base),
+                                             subset_name=name))
 
     vr = base / "video_retrieval"
     if vr.is_dir():
@@ -403,4 +335,4 @@ def build_mixed_dataloader(data_dir: str, image_dir=None,
 
     combined = ConcatDataset(parts)
     logger.info("Mixed total: %d examples from %d sources", len(combined), len(parts))
-    return _make_dataloader(combined, batch_size, num_workers, shuffle)
+    return combined

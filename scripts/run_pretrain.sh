@@ -21,9 +21,10 @@ fi
 : "${MODEL_PATH:=${ROOT}/models/checkpoints/Qwen3.5-0.8B}"
 : "${OUTPUT_DIR:=/data/outputs/qwen35-0.8b-10M-pretrain}"
 : "${IMAGE_DIR:=${ROOT}/datasets/mmeb_train_images/images}"
+: "${MEGAPAIRS_IMAGE_DIR:=/home/jupyter/shared/megapairs_images}"
 : "${DATA_DIR:=/data/training_data}"
 
-: "${BATCH_SIZE:=64}"
+: "${BATCH_SIZE:=32}"
 : "${GRAD_ACCUM:=1}"
 : "${EPOCHS:=1}"
 : "${LR:=2e-5}"
@@ -43,7 +44,7 @@ fi
 : "${USE_WANDB:=true}"
 : "${WANDB_PROJECT:=embeddings}"
 : "${WANDB_ENTITY:=radi-and-people}"
-: "${WANDB_RUN_NAME:=qwen35-0.8b-10M-pretrain-bs64}"
+: "${WANDB_RUN_NAME:=qwen35-0.8b-10M-pretrain-bs32}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -76,6 +77,7 @@ ARGS="--model_path ${MODEL_PATH} --output_dir ${OUTPUT_DIR} \
     --save_steps ${SAVE_STEPS} --log_interval ${LOG_INTERVAL}"
 
 [ -n "${IMAGE_DIR:-}" ]    && ARGS="${ARGS} --image_dir ${IMAGE_DIR}"
+[ -n "${MEGAPAIRS_IMAGE_DIR:-}" ] && ARGS="${ARGS} --megapairs_image_dir ${MEGAPAIRS_IMAGE_DIR}"
 [ -n "${DATA_DIR:-}" ]     && ARGS="${ARGS} --data_dir ${DATA_DIR}"
 [ -n "${SUBSETS:-}" ]      && ARGS="${ARGS} --subsets ${SUBSETS}"
 [ -n "${TASK_TYPES:-}" ]   && ARGS="${ARGS} --task_types ${TASK_TYPES}"

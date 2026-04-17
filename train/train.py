@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """Multimodal contrastive pretraining for Qwen3.5 / Qwen3-VL embedding models.
 
-Simple DDP training with cross-GPU embedding gathering for contrastive loss.
-Each GPU encodes its local batch, embeddings are gathered across GPUs via
-GatherWithGrad so the loss sees (batch_size * num_gpus) in-batch negatives,
-then loss.backward() flows gradients back through DDP normally.
-
-No GradCache -- batch_size must fit in GPU memory. Scale effective batch
-by adding GPUs (batch_size * num_gpus) or gradient_accumulation_steps.
+DDP training with cross-GPU embedding gathering for contrastive loss.
+Each GPU encodes its local batch in a single forward pass (queries + positives
+concatenated), embeddings are gathered across GPUs via GatherWithGrad, loss
+sees (batch_size * num_gpus) in-batch negatives. DDP handles gradient sync.
 """
 
 import argparse
@@ -26,11 +23,12 @@ from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.utils import set_seed
 from peft import LoraConfig, TaskType, get_peft_model
 from torch.optim import AdamW
+from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from train.dataset import build_dataloader, build_mixed_dataloader, collate_embedding_batch
+from train.dataset import build_dataloader, build_mixed_dataset, collate_embedding_batch
 from train.losses import (
     cosent_loss, masked_infonce_loss, mrl_cosent_loss, mrl_infonce_loss,
 )
@@ -45,6 +43,10 @@ LORA_TARGETS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Distributed
+# ---------------------------------------------------------------------------
+
 def _world():
     return dist.get_world_size() if dist.is_initialized() else 1
 
@@ -53,7 +55,7 @@ def _rank():
 
 
 class GatherWithGrad(torch.autograd.Function):
-    """all_gather that lets gradients flow back through the local shard."""
+    """all_gather with gradient flow back to the local shard."""
     @staticmethod
     def forward(ctx, x):
         if _world() == 1:
@@ -71,46 +73,56 @@ class GatherWithGrad(torch.autograd.Function):
         return grad[_rank() * chunk : (_rank() + 1) * chunk]
 
 
-def _gather_metadata(task_types, scores):
+def _gather_metadata(task_types, scores, device):
+    """Gather task_types and scores across ranks. Always executes the same
+    collective ops on every rank to prevent deadlocks."""
     if _world() == 1:
         return task_types, scores
     all_tt = [None] * _world()
     dist.all_gather_object(all_tt, list(task_types))
     g_tt = [t for sub in all_tt for t in sub]
-    if scores is not None:
-        parts = [torch.zeros_like(scores) for _ in range(_world())]
-        dist.all_gather(parts, scores.contiguous())
-        return g_tt, torch.cat(parts, dim=0)
+    # Always gather scores (use zeros if this rank has none) so all ranks
+    # execute the same number of collectives.
+    bs = len(task_types)
+    local_scores = scores if scores is not None else torch.zeros(bs, device=device)
+    parts = [torch.zeros_like(local_scores) for _ in range(_world())]
+    dist.all_gather(parts, local_scores.contiguous())
+    g_scores = torch.cat(parts, dim=0)
+    has_scores = scores is not None
+    # Check if ANY rank actually had real scores
+    has_flag = torch.tensor([1.0 if has_scores else 0.0], device=device)
+    dist.all_reduce(has_flag)
+    if has_flag.item() > 0:
+        return g_tt, g_scores
     return g_tt, None
 
 
-def _format_item(embedder, e):
-    return embedder.format_model_input(
+# ---------------------------------------------------------------------------
+# Encoding — single forward pass for both queries and positives
+# ---------------------------------------------------------------------------
+
+def _encode_batch(model, embedder, items, device):
+    """Encode a list of items in one forward pass -> (N, D) embeddings."""
+    convs = [embedder.format_model_input(
         text=e.get("text"), image=e.get("image"),
         video=e.get("video"), instruction=e.get("instruction"))
-
-
-def _format_text_only(embedder, e):
-    return embedder.format_model_input(
-        text=e.get("text") or "NULL", instruction=e.get("instruction"))
-
-
-def _encode(model, embedder, items, device):
-    """Encode a batch. On vision preprocessing failure, retry as text-only.
-    OOM and timeouts are not caught — they propagate to fail the step."""
-    if not items:
-        return None
-    convs = [_format_item(embedder, e) for e in items]
+        for e in items]
     try:
         proc = embedder._preprocess_inputs(convs)
     except Exception as exc:
-        logger.warning("Vision preprocess failed (%s), text-only fallback for batch", exc)
-        convs = [_format_text_only(embedder, e) for e in items]
+        logger.warning("Vision preprocess failed (%s), text-only fallback", exc)
+        convs = [embedder.format_model_input(
+            text=e.get("text") or "NULL", instruction=e.get("instruction"))
+            for e in items]
         proc = embedder._preprocess_inputs(convs)
     proc = {k: v.to(device) for k, v in proc.items() if torch.is_tensor(v)}
     out = model(**proc)
     return embedder._pooling_last(out.last_hidden_state, proc["attention_mask"])
 
+
+# ---------------------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------------------
 
 def _compute_loss(q_emb, p_emb, task_types, scores, args):
     mrl = args.mrl_dims if args.use_mrl else None
@@ -142,19 +154,30 @@ def _compute_loss(q_emb, p_emb, task_types, scores, args):
     return sum(losses) / len(losses)
 
 
-def _train_step(embedder, raw_model, device, batch, args):
-    q_local = _encode(raw_model, embedder, batch["queries"], device)
-    p_local = _encode(raw_model, embedder, batch["positives"], device)
-    if _world() > 1:
-        dist.barrier()
+# ---------------------------------------------------------------------------
+# Training step — one forward, one backward, DDP handles grad sync
+# ---------------------------------------------------------------------------
+
+def _train_step(embedder, model, device, batch, args):
+    """Two forward passes (queries, positives), gather, loss, backward.
+    DDP handles gradient sync automatically during backward()."""
+    q_local = _encode_batch(model, embedder, batch["queries"], device)
+    p_local = _encode_batch(model, embedder, batch["positives"], device)
+
     q = GatherWithGrad.apply(q_local) if _world() > 1 else q_local
     p = GatherWithGrad.apply(p_local) if _world() > 1 else p_local
+
     scores = batch["scores"].to(device) if batch["scores"] is not None else None
-    g_tt, g_scores = _gather_metadata(batch["task_types"], scores)
+    g_tt, g_scores = _gather_metadata(batch["task_types"], scores, device)
+
     loss = _compute_loss(q, p, g_tt, g_scores, args)
     loss.backward()
     return loss.detach().float().item()
 
+
+# ---------------------------------------------------------------------------
+# Setup helpers
+# ---------------------------------------------------------------------------
 
 def _detect_model_type(model_path):
     cfg = Path(model_path) / "config.json"
@@ -165,8 +188,13 @@ def _detect_model_type(model_path):
     return "qwen35"
 
 
-def _load_embedder(model_path, max_length, model_type, max_pixels=None):
-    kw = {"max_pixels": max_pixels} if max_pixels else {}
+def _load_embedder(model_path, max_length, model_type, max_pixels=None,
+                    video_total_pixels=None):
+    kw = {}
+    if max_pixels:
+        kw["max_pixels"] = max_pixels
+    if video_total_pixels:
+        kw["total_pixels"] = video_total_pixels
     if model_type == "qwen3vl":
         sd = Path(model_path) / "scripts"
         if sd.exists():
@@ -193,25 +221,39 @@ def _save_ckpt(accelerator, embedder, args, step, final=False):
 def _build_dataloader(args, embedder, batch_size):
     subsets = args.subsets.split(",") if args.subsets else None
     tt_filter = args.task_types.split(",") if args.task_types else None
-    kw = dict(batch_size=batch_size, num_workers=args.num_workers, shuffle=True)
     if args.data_dir:
-        return build_mixed_dataloader(
+        dataset = build_mixed_dataset(
             data_dir=args.data_dir, image_dir=args.image_dir,
+            megapairs_image_dir=args.megapairs_image_dir,
             mmeb_split=args.dataset_split,
             max_samples_per_subset=args.max_samples_per_subset,
-            cache_dir=args.cache_dir, **kw)
-    return build_dataloader(
-        subsets=subsets, task_types=tt_filter, split=args.dataset_split,
-        image_dir=args.image_dir, max_samples_per_subset=args.max_samples_per_subset,
-        cache_dir=args.cache_dir, **kw)
+            cache_dir=args.cache_dir)
+    else:
+        return build_dataloader(
+            subsets=subsets, task_types=tt_filter, split=args.dataset_split,
+            image_dir=args.image_dir, max_samples_per_subset=args.max_samples_per_subset,
+            cache_dir=args.cache_dir,
+            batch_size=batch_size, num_workers=args.num_workers, shuffle=True)
 
+    from torch.utils.data import DistributedSampler
+    sampler = DistributedSampler(dataset, num_replicas=_world(),
+                                 rank=_rank(), shuffle=True, seed=args.seed) if _world() > 1 else None
+    return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
+                      shuffle=(sampler is None),
+                      collate_fn=collate_embedding_batch,
+                      num_workers=args.num_workers, drop_last=True, pin_memory=False)
+
+
+# ---------------------------------------------------------------------------
+# Train
+# ---------------------------------------------------------------------------
 
 def train(args):
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         log_with="wandb" if args.use_wandb else None,
         mixed_precision="bf16",
-        kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(minutes=60))])
+        kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(minutes=5))])
 
     set_seed(args.seed)
     if accelerator.is_main_process:
@@ -230,7 +272,8 @@ def train(args):
 
     mt = _detect_model_type(args.model_path)
     accelerator.print(f"Loading {args.model_path} (type={mt})")
-    embedder = _load_embedder(args.model_path, args.max_length, mt, args.max_pixels)
+    embedder = _load_embedder(args.model_path, args.max_length, mt, args.max_pixels,
+                              args.video_total_pixels)
     embedder.model = get_peft_model(embedder.model, LoraConfig(
         task_type=TaskType.FEATURE_EXTRACTION, r=args.lora_rank,
         lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
@@ -254,38 +297,25 @@ def train(args):
                       weight_decay=args.weight_decay)
     embedder.model, optimizer = accelerator.prepare(embedder.model, optimizer)
 
-    if world > 1:
-        from torch.utils.data import DistributedSampler
-        sampler = DistributedSampler(dataloader.dataset, num_replicas=world,
-                                     rank=_rank(), shuffle=True, seed=args.seed)
-        dataloader = torch.utils.data.DataLoader(
-            dataloader.dataset, batch_size=bs, sampler=sampler,
-            collate_fn=collate_embedding_batch, num_workers=args.num_workers,
-            drop_last=True, pin_memory=False)
-
     total_steps = len(dataloader) * args.epochs
     warmup = int(total_steps * args.warmup_ratio)
     scheduler = accelerator.prepare(get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup, num_training_steps=total_steps))
     accelerator.print(f"  Steps: {total_steps} ({len(dataloader)}/epoch), warmup={warmup}")
 
-    raw_model = accelerator.unwrap_model(embedder.model)
     global_step = 0
     embedder.model.train()
     for epoch in range(args.epochs):
         epoch_loss, epoch_steps, t0 = 0.0, 0, time.time()
-        if hasattr(dataloader, 'sampler') and hasattr(dataloader.sampler, 'set_epoch'):
-            dataloader.sampler.set_epoch(epoch)
+        for attr in ('batch_sampler', 'sampler'):
+            s = getattr(dataloader, attr, None)
+            if s and hasattr(s, 'set_epoch'):
+                s.set_epoch(epoch)
+                break
         for batch in dataloader:
             optimizer.zero_grad()
-            with accelerator.no_sync(embedder.model):
-                step_loss = _train_step(
-                    embedder, raw_model, accelerator.device, batch, args)
-            if world > 1:
-                dist.barrier()
-                for p in embedder.model.parameters():
-                    if p.grad is not None:
-                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+            step_loss = _train_step(
+                embedder, embedder.model, accelerator.device, batch, args)
             torch.nn.utils.clip_grad_norm_(
                 embedder.model.parameters(), args.max_grad_norm)
             optimizer.step()
@@ -323,12 +353,14 @@ def main():
     p.add_argument("--output_dir", default="outputs/qwen35-embedding-train")
     p.add_argument("--max_length", type=int, default=512)
     p.add_argument("--max_pixels", type=int, default=1310720)
+    p.add_argument("--video_total_pixels", type=int, default=9216000)
     p.add_argument("--lora_rank", type=int, default=32)
     p.add_argument("--lora_alpha", type=int, default=32)
     p.add_argument("--lora_dropout", type=float, default=0.05)
     p.add_argument("--gradient_checkpointing", action="store_true")
     p.add_argument("--data_dir", default=None)
     p.add_argument("--image_dir", default=None)
+    p.add_argument("--megapairs_image_dir", default=None)
     p.add_argument("--dataset_split", default="diverse_instruction")
     p.add_argument("--subsets", default=None)
     p.add_argument("--task_types", default=None)
