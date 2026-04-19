@@ -2,9 +2,8 @@
 """Multimodal contrastive pretraining for Qwen3.5 / Qwen3-VL embedding models.
 
 DDP training with cross-GPU embedding gathering for contrastive loss.
-Each GPU encodes its local batch in a single forward pass (queries + positives
-concatenated), embeddings are gathered across GPUs via GatherWithGrad, loss
-sees (batch_size * num_gpus) in-batch negatives. DDP handles gradient sync.
+Two parallel forward passes (queries + positives) via CUDA streams,
+embeddings gathered across GPUs via GatherWithGrad for in-batch negatives.
 """
 
 import argparse
@@ -36,6 +35,88 @@ from train.losses import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Patch GatedDeltaNet to keep gating in bf16 (avoids fp32 cast that slows fla)
+# ---------------------------------------------------------------------------
+
+def _patch_gdn_bf16():
+    try:
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
+    except ImportError:
+        return False
+
+    def _bf16_forward(self, hidden_states, cache_params=None, **kwargs):
+        batch_size, seq_len, _ = hidden_states.shape
+        use_precomputed_states = cache_params is not None and cache_params.has_previous_state
+
+        if use_precomputed_states:
+            conv_state = cache_params.layers[self.layer_idx].conv_states
+            recurrent_state = cache_params.layers[self.layer_idx].recurrent_states
+
+        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
+        z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
+        b = self.in_proj_b(hidden_states)
+        a = self.in_proj_a(hidden_states)
+
+        if use_precomputed_states:
+            mixed_qkv = self.causal_conv1d_update(
+                mixed_qkv, conv_state,
+                self.conv1d.weight.squeeze(1), self.conv1d.bias, self.activation)
+        else:
+            if cache_params is not None:
+                conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
+                conv_state = cache_params.update_conv_state(conv_state, self.layer_idx)
+            if self.causal_conv1d_fn is not None:
+                mixed_qkv = self.causal_conv1d_fn(
+                    x=mixed_qkv, weight=self.conv1d.weight.squeeze(1),
+                    bias=self.conv1d.bias, activation=self.activation, seq_idx=None)
+            else:
+                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+
+        mixed_qkv = mixed_qkv.transpose(1, 2)
+        query, key, value = torch.split(mixed_qkv,
+            [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+
+        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
+        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
+        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+
+        beta = b.sigmoid()
+        target_dtype = query.dtype
+        g = -self.A_log.to(target_dtype).exp() * F.softplus(a.to(target_dtype) + self.dt_bias.to(target_dtype))
+
+        if self.num_v_heads // self.num_k_heads > 1:
+            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+
+        if not use_precomputed_states:
+            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                query, key, value, g=g, beta=beta,
+                initial_state=None, output_final_state=cache_params is not None,
+                use_qk_l2norm_in_kernel=True)
+        else:
+            core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
+                query, key, value, g=g, beta=beta,
+                initial_state=recurrent_state, output_final_state=cache_params is not None,
+                use_qk_l2norm_in_kernel=True)
+
+        if cache_params is not None and last_recurrent_state is not None:
+            cache_params.layers[self.layer_idx].recurrent_states = last_recurrent_state
+
+        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
+        z = z.reshape(-1, self.head_v_dim)
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+        return self.out_proj(core_attn_out)
+
+    Qwen3_5GatedDeltaNet.forward = _bf16_forward
+    return True
+
+
+if _patch_gdn_bf16():
+    logger.info("Patched Qwen3_5GatedDeltaNet for bf16 gating (fla fast path)")
+
 LORA_TARGETS = {
     "qwen35": ["q_proj", "k_proj", "v_proj", "up_proj", "down_proj", "gate_proj"],
     "qwen3vl": ["q_proj", "k_proj", "v_proj", "up_proj", "down_proj", "gate_proj",
@@ -55,7 +136,6 @@ def _rank():
 
 
 class GatherWithGrad(torch.autograd.Function):
-    """all_gather with gradient flow back to the local shard."""
     @staticmethod
     def forward(ctx, x):
         if _world() == 1:
@@ -74,22 +154,19 @@ class GatherWithGrad(torch.autograd.Function):
 
 
 def _gather_metadata(task_types, scores, device):
-    """Gather task_types and scores across ranks. Always executes the same
-    collective ops on every rank to prevent deadlocks."""
+    """Gather task_types and scores across ranks.
+    Always executes the same collectives on every rank to prevent deadlocks."""
     if _world() == 1:
         return task_types, scores
     all_tt = [None] * _world()
     dist.all_gather_object(all_tt, list(task_types))
     g_tt = [t for sub in all_tt for t in sub]
-    # Always gather scores (use zeros if this rank has none) so all ranks
-    # execute the same number of collectives.
     bs = len(task_types)
     local_scores = scores if scores is not None else torch.zeros(bs, device=device)
     parts = [torch.zeros_like(local_scores) for _ in range(_world())]
     dist.all_gather(parts, local_scores.contiguous())
     g_scores = torch.cat(parts, dim=0)
     has_scores = scores is not None
-    # Check if ANY rank actually had real scores
     has_flag = torch.tensor([1.0 if has_scores else 0.0], device=device)
     dist.all_reduce(has_flag)
     if has_flag.item() > 0:
@@ -98,11 +175,10 @@ def _gather_metadata(task_types, scores, device):
 
 
 # ---------------------------------------------------------------------------
-# Encoding — single forward pass for both queries and positives
+# Encoding
 # ---------------------------------------------------------------------------
 
 def _encode_batch(model, embedder, items, device):
-    """Encode a list of items in one forward pass -> (N, D) embeddings."""
     convs = [embedder.format_model_input(
         text=e.get("text"), image=e.get("image"),
         video=e.get("video"), instruction=e.get("instruction"))
@@ -115,7 +191,8 @@ def _encode_batch(model, embedder, items, device):
             text=e.get("text") or "NULL", instruction=e.get("instruction"))
             for e in items]
         proc = embedder._preprocess_inputs(convs)
-    proc = {k: v.to(device) for k, v in proc.items() if torch.is_tensor(v)}
+    proc = {k: v.to(device, non_blocking=True) for k, v in proc.items()
+            if torch.is_tensor(v)}
     out = model(**proc)
     return embedder._pooling_last(out.last_hidden_state, proc["attention_mask"])
 
@@ -155,16 +232,34 @@ def _compute_loss(q_emb, p_emb, task_types, scores, args):
 
 
 # ---------------------------------------------------------------------------
-# Training step — one forward, one backward, DDP handles grad sync
+# Training step — parallel q/p encoding via CUDA streams
 # ---------------------------------------------------------------------------
 
-def _train_step(embedder, model, device, batch, args):
-    """Two forward passes (queries, positives), gather, loss, backward.
-    DDP handles gradient sync automatically during backward()."""
-    q_local = _encode_batch(model, embedder, batch["queries"], device)
-    p_local = _encode_batch(model, embedder, batch["positives"], device)
+_stream_q = None
+_stream_p = None
 
+
+def _get_streams(device):
+    global _stream_q, _stream_p
+    if _stream_q is None:
+        _stream_q = torch.cuda.Stream(device=device)
+        _stream_p = torch.cuda.Stream(device=device)
+    return _stream_q, _stream_p
+
+
+def _train_step(embedder, model, device, batch, args):
+    sq, sp = _get_streams(device)
+
+    with torch.cuda.stream(sq):
+        q_local = _encode_batch(model, embedder, batch["queries"], device)
+
+    with torch.cuda.stream(sp):
+        p_local = _encode_batch(model, embedder, batch["positives"], device)
+
+    sq.synchronize()
     q = GatherWithGrad.apply(q_local) if _world() > 1 else q_local
+
+    sp.synchronize()
     p = GatherWithGrad.apply(p_local) if _world() > 1 else p_local
 
     scores = batch["scores"].to(device) if batch["scores"] is not None else None
@@ -241,7 +336,9 @@ def _build_dataloader(args, embedder, batch_size):
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
                       shuffle=(sampler is None),
                       collate_fn=collate_embedding_batch,
-                      num_workers=args.num_workers, drop_last=True, pin_memory=False)
+                      num_workers=args.num_workers, drop_last=True,
+                      pin_memory=True, persistent_workers=args.num_workers > 0,
+                      prefetch_factor=2 if args.num_workers > 0 else None)
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +391,7 @@ def train(args):
 
     dataloader = _build_dataloader(args, embedder, bs)
     optimizer = AdamW(embedder.model.parameters(), lr=args.lr,
-                      weight_decay=args.weight_decay)
+                      weight_decay=args.weight_decay, fused=True)
     embedder.model, optimizer = accelerator.prepare(embedder.model, optimizer)
 
     total_steps = len(dataloader) * args.epochs
@@ -314,8 +411,17 @@ def train(args):
                 break
         for batch in dataloader:
             optimizer.zero_grad()
-            step_loss = _train_step(
-                embedder, embedder.model, accelerator.device, batch, args)
+            try:
+                step_loss = _train_step(
+                    embedder, embedder.model, accelerator.device, batch, args)
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                logger.warning("OOM at step %d, skipping batch", global_step + 1)
+                optimizer.zero_grad()
+                scheduler.step()
+                epoch_steps += 1
+                global_step += 1
+                continue
             torch.nn.utils.clip_grad_norm_(
                 embedder.model.parameters(), args.max_grad_norm)
             optimizer.step()

@@ -24,7 +24,7 @@ fi
 : "${MEGAPAIRS_IMAGE_DIR:=/home/jupyter/shared/megapairs_images}"
 : "${DATA_DIR:=/data/training_data}"
 
-: "${BATCH_SIZE:=32}"
+: "${BATCH_SIZE:=48}"
 : "${GRAD_ACCUM:=1}"
 : "${EPOCHS:=1}"
 : "${LR:=2e-5}"
@@ -44,7 +44,7 @@ fi
 : "${USE_WANDB:=true}"
 : "${WANDB_PROJECT:=embeddings}"
 : "${WANDB_ENTITY:=radi-and-people}"
-: "${WANDB_RUN_NAME:=qwen35-0.8b-10M-pretrain-bs32}"
+: "${WANDB_RUN_NAME:=qwen35-0.8b-10M-pretrain-bs48-fla-fused}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

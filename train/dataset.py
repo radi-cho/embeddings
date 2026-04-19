@@ -49,7 +49,6 @@ FRAME_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 # ---------------------------------------------------------------------------
 
 def _load_image(path: str, image_dir: Optional[str] = None) -> Optional[Image.Image]:
-    """Load an image from a local path under image_dir. Returns None if missing."""
     if not path or not image_dir:
         return None
     rel = path.replace("images/", "", 1) if path.startswith("images/") else path
@@ -61,8 +60,6 @@ def _load_image(path: str, image_dir: Optional[str] = None) -> Optional[Image.Im
 
 
 def _resolve_video(path: str) -> Any:
-    """If path is a directory of frame images, return sorted frame paths.
-    Otherwise return the path as-is (treated as a video file)."""
     if not path or not os.path.isdir(path):
         return path or None
     frames = sorted(
@@ -94,8 +91,7 @@ def _load_jsonl(path: str, max_samples: Optional[int] = None) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
-# Dataset classes — each returns {query, positive, task_type, subset_name}
-# query/positive are dicts with optional text/image/video keys.
+# Dataset classes
 # ---------------------------------------------------------------------------
 
 class MMEBDataset(Dataset):
@@ -279,13 +275,13 @@ def build_dataloader(subsets=None, task_types=None, split="diverse_instruction",
                             max_samples_per_subset, cache_dir)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
                       collate_fn=collate_embedding_batch,
-                      num_workers=num_workers, drop_last=True, pin_memory=False)
+                      num_workers=num_workers, drop_last=True,
+                      pin_memory=True, persistent_workers=num_workers > 0)
 
 
 def build_mixed_dataset(data_dir, image_dir=None, megapairs_image_dir=None,
                         mmeb_split="diverse_instruction",
                         max_samples_per_subset=None, cache_dir=None):
-    """Build a ConcatDataset from all sources under data_dir + MMEB from HF."""
     base = Path(data_dir)
     parts: List[Dataset] = []
 
