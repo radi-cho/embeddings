@@ -31,6 +31,7 @@ Usage:
     python eval/run_mmeb.py --list_tasks
 """
 
+from typing import Optional
 import argparse
 import json
 import os
