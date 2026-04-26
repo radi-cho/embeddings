@@ -123,3 +123,55 @@ def mrl_cosent_loss(
     temperature: float = DEFAULT_TEMPERATURE,
 ) -> torch.Tensor:
     return _mrl_loop(cosent_loss, a, b, mrl_dims, scores=scores, temperature=temperature)
+
+
+# ---------------------------------------------------------------------------
+# Classification-specific InfoNCE (class-label negatives only, no in-batch)
+# ---------------------------------------------------------------------------
+
+def classification_infonce_loss(
+    q: torch.Tensor,
+    p: torch.Tensor,
+    neg_labels: torch.Tensor,
+    temperature: float = DEFAULT_TEMPERATURE,
+) -> torch.Tensor:
+    """InfoNCE where negatives are wrong-class labels per query (not in-batch).
+
+    Args:
+        q: (B, D) L2-normalized query embeddings
+        p: (B, D) L2-normalized positive label embeddings
+        neg_labels: (B*K, D) L2-normalized wrong-class label embeddings,
+                    K negatives per query, flattened
+        temperature: softmax temperature
+    """
+    B = q.shape[0]
+    pos = (q * p).sum(-1) / temperature  # (B,)
+
+    if neg_labels.shape[0] == 0 or neg_labels.shape[0] % B != 0:
+        return -torch.log(torch.sigmoid(pos) + 1e-12).mean()
+
+    K = neg_labels.shape[0] // B
+    neg = neg_labels.view(B, K, -1)
+    neg_scores = torch.bmm(neg, q.unsqueeze(-1)).squeeze(-1) / temperature  # (B, K)
+
+    logits = torch.cat([pos.unsqueeze(1), neg_scores], dim=1)  # (B, 1+K)
+    labels = torch.zeros(B, device=q.device, dtype=torch.long)
+    return F.cross_entropy(logits, labels)
+
+
+def mrl_classification_loss(
+    q: torch.Tensor,
+    p: torch.Tensor,
+    neg_labels: torch.Tensor,
+    mrl_dims: List[int] = DEFAULT_MRL_DIMS,
+    temperature: float = DEFAULT_TEMPERATURE,
+) -> torch.Tensor:
+    B = q.shape[0]
+    K = neg_labels.shape[0] // B if neg_labels.shape[0] > 0 and neg_labels.shape[0] % B == 0 else 0
+    total = torch.tensor(0.0, device=q.device)
+    for d in mrl_dims:
+        qd = F.normalize(q[:, :d], dim=-1)
+        pd = F.normalize(p[:, :d], dim=-1)
+        nd = F.normalize(neg_labels[:, :d], dim=-1) if K > 0 else neg_labels[:, :d]
+        total = total + classification_infonce_loss(qd, pd, nd, temperature=temperature)
+    return total / len(mrl_dims)
