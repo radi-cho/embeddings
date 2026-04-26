@@ -1,12 +1,19 @@
 """Dataset module for multimodal embedding training.
 
+Two dataset builders:
+  - `build_mixed_dataset`:  Stage 1 (large, weakly supervised; in-batch negs)
+  - `build_stage2_dataset`: Stage 2 (curated; mined K hard-negatives per query +
+                             MMEB classification wrong-class labels + AllNLI
+                             contradictions + STS-B for CoSENT)
+
 Data sources:
 - MMEB-train (TIGER-Lab/MMEB-train): 20 subsets, VQA/classification/retrieval
 - Text triplets: MS MARCO, AllNLI, GooAQ, Quora (JSONL)
 - STS-B: sentence pairs with float scores (JSONL)
-- MegaPairs: image-text pairs (JSONL annotations + local images)
-- ColPali: visual document retrieval (Arrow with embedded images)
-- Video: LLaVA-Hound (JSONL + extracted frame directories)
+- MegaPairs: image-text pairs (JSONL + local images)    [Stage 1 only]
+- ColPali: visual document retrieval (Arrow + embedded images)
+- Video: LLaVA-Hound / MSRVTT (JSONL + frame dirs)      [Stage 1 only]
+- Mined hard-negatives: scripts/mine_hard_negatives.py output (JSONL)
 """
 
 import io
@@ -113,13 +120,20 @@ class MMEBDataset(Dataset):
 
     def __getitem__(self, idx):
         r = self.data[idx]
-        return {
+        out = {
             "query": {"text": _clean_mmeb_text(r["qry"]) or None,
                       "image": _load_image(r.get("qry_image_path", ""), self.image_dir)},
             "positive": {"text": _clean_mmeb_text(r.get("pos_text", "")) or None,
                          "image": _load_image(r.get("pos_image_path", ""), self.image_dir)},
             "task_type": self.task_type, "subset_name": self.subset_name,
         }
+        if self.task_type == "classification":
+            neg_text = r.get("neg_text")
+            if neg_text and isinstance(neg_text, str) and neg_text.strip():
+                out["negative_texts"] = [_clean_mmeb_text(neg_text)]
+            elif neg_text and isinstance(neg_text, list) and len(neg_text) > 0:
+                out["negative_texts"] = [_clean_mmeb_text(t) for t in neg_text if t]
+        return out
 
 
 class STSDataset(Dataset):
@@ -149,9 +163,59 @@ class TextTripletDataset(Dataset):
 
     def __getitem__(self, idx):
         r = self.data[idx]
-        return {"query": {"text": r["query"]}, "positive": {"text": r["positive"]},
-                "task_type": r.get("task_type", "retrieval"),
-                "subset_name": self.subset_name}
+        out = {"query": {"text": r["query"]}, "positive": {"text": r["positive"]},
+               "task_type": r.get("task_type", "retrieval"),
+               "subset_name": self.subset_name}
+        neg = r.get("negative") or r.get("hard_negative")
+        if isinstance(neg, str) and neg.strip():
+            out["hard_negatives"] = [{"text": neg, "image": None, "video": None}]
+        elif isinstance(neg, list) and neg:
+            out["hard_negatives"] = [{"text": t, "image": None, "video": None}
+                                      for t in neg if isinstance(t, str) and t.strip()]
+        return out
+
+
+class MinedNegativesDataset(Dataset):
+    """Rows of mined hard-negative JSONL produced by scripts/mine_hard_negatives.py.
+
+    Each line:
+      {"query":{"text":..,"image_path":..},
+       "positive":{"text":..,"image_path":..},
+       "hard_negatives":[{"text":..,"image_path":..}, ...],
+       "task_type": "...", "subset_name": "..."}
+    """
+
+    def __init__(self, jsonl_path, image_dir=None, max_samples=None,
+                 max_hard_negatives=15, subset_name=None):
+        self.jsonl_path = str(jsonl_path)
+        self.image_dir = image_dir
+        self.max_hn = max_hard_negatives
+        self.subset_name = subset_name or Path(jsonl_path).stem
+        self.data = _load_jsonl(self.jsonl_path, max_samples)
+        logger.info("MinedNegatives '%s': %d rows", self.subset_name, len(self.data))
+
+    def __len__(self):
+        return len(self.data)
+
+    def _side(self, side):
+        text = side.get("text")
+        img = None
+        p = side.get("image_path")
+        if p and self.image_dir:
+            img = _load_image(p, self.image_dir)
+        return {"text": text, "image": img, "video": None}
+
+    def __getitem__(self, idx):
+        r = self.data[idx]
+        hns_raw = r.get("hard_negatives") or []
+        hns = [self._side(h) for h in hns_raw[: self.max_hn]]
+        return {
+            "query": self._side(r["query"]),
+            "positive": self._side(r["positive"]),
+            "hard_negatives": hns,
+            "task_type": r.get("task_type", "retrieval"),
+            "subset_name": r.get("subset_name", self.subset_name),
+        }
 
 
 class MegaPairsDataset(Dataset):
@@ -225,6 +289,8 @@ class VideoTripletDataset(Dataset):
 def collate_embedding_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     queries, positives, task_types, scores = [], [], [], []
     has_scores = any("score" in item for item in batch)
+    negative_texts: List[Optional[List[str]]] = []
+    hard_negatives_per_item: List[List[Dict[str, Any]]] = []
 
     for item in batch:
         for lst, key in [(queries, "query"), (positives, "positive")]:
@@ -234,10 +300,39 @@ def collate_embedding_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         task_types.append(item["task_type"])
         if has_scores:
             scores.append(item.get("score", 0.0))
+        negative_texts.append(item.get("negative_texts"))
+        hns = item.get("hard_negatives") or []
+        hard_negatives_per_item.append([
+            {"text": h.get("text"), "image": h.get("image"),
+             "video": h.get("video"), "instruction": DEFAULT_INSTRUCTION}
+            for h in hns
+        ])
 
-    return {"queries": queries, "positives": positives,
-            "task_types": task_types,
-            "scores": torch.tensor(scores, dtype=torch.float32) if scores else None}
+    out = {"queries": queries, "positives": positives,
+           "task_types": task_types,
+           "scores": torch.tensor(scores, dtype=torch.float32) if scores else None}
+
+    if any(nt is not None for nt in negative_texts):
+        out["negative_texts"] = negative_texts
+
+    # Pad hard-negative lists to the batch-max K so the downstream loss sees
+    # a uniform (B, K, D) tensor. Pad with a sentinel (text="NULL") which gets
+    # masked out by the false-negative margin filter in masked_infonce_loss.
+    max_k = max((len(hns) for hns in hard_negatives_per_item), default=0)
+    if max_k > 0:
+        sentinel = {"text": "NULL", "image": None, "video": None,
+                    "instruction": DEFAULT_INSTRUCTION}
+        padded = []
+        for hns in hard_negatives_per_item:
+            if len(hns) == 0:
+                padded.append([dict(sentinel) for _ in range(max_k)])
+            elif len(hns) < max_k:
+                # repeat the last one to reach max_k (still a hard neg, just dupe)
+                padded.append(list(hns) + [hns[-1]] * (max_k - len(hns)))
+            else:
+                padded.append(hns[:max_k])
+        out["hard_negatives"] = padded
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -331,4 +426,76 @@ def build_mixed_dataset(data_dir, image_dir=None, megapairs_image_dir=None,
 
     combined = ConcatDataset(parts)
     logger.info("Mixed total: %d examples from %d sources", len(combined), len(parts))
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# Stage-2 mixed dataset: mined hard-negatives + unmined originals
+# ---------------------------------------------------------------------------
+
+def build_stage2_dataset(
+    data_dir, mined_dir="/data/training_data_mined",
+    image_dir=None, mmeb_split="diverse_instruction",
+    max_samples_per_subset=None, cache_dir=None,
+    max_hard_negatives=15,
+):
+    """Stage-2 dataset (paper §4.3): mined hard-negatives + curated originals.
+
+    Sources:
+      - MinedNegativesDataset for each <name>.jsonl under mined_dir  (K hard negs)
+      - MMEBDataset for classification subsets (use neg_cand as wrong-class neg)
+      - TextTripletDataset for AllNLI (uses its built-in `negative`, 1 HN)
+      - STSDataset for STS-B  (CoSENT loss path)
+
+    EXCLUDES (already in Stage-1, no new signal from in-batch-only):
+      MegaPairs, LLaVA-Hound, MSRVTT / other video retrieval datasets.
+    """
+    base = Path(data_dir)
+    mined = Path(mined_dir)
+    parts: List[Dataset] = []
+
+    # --- Mined hard-neg datasets (MMEB retrieval/VQA + text + ColPali) -----
+    # MMEB mined files may be named mmeb_<subset>.jsonl; the row's own
+    # subset_name / task_type field still takes precedence at __getitem__,
+    # the MinedNegativesDataset.subset_name is just for logging.
+    if mined.is_dir():
+        for fp in sorted(mined.glob("*.jsonl")):
+            if fp.stat().st_size == 0:
+                continue
+            sname = fp.stem[len("mmeb_"):] if fp.stem.startswith("mmeb_") else fp.stem
+            try:
+                parts.append(MinedNegativesDataset(
+                    str(fp), image_dir=image_dir,
+                    max_samples=max_samples_per_subset,
+                    max_hard_negatives=max_hard_negatives,
+                    subset_name=sname))
+            except Exception as e:
+                logger.error("MinedNegatives '%s': %s", fp.name, e)
+    logger.info("Stage2: loaded %d mined source(s)", len(parts))
+
+    # --- MMEB classification (wrong-class negatives via neg_cand) ----------
+    for name in TASK_TYPE_MAP["classification"]:
+        try:
+            parts.append(MMEBDataset(
+                name, split=mmeb_split, image_dir=image_dir,
+                max_samples=max_samples_per_subset, cache_dir=cache_dir))
+        except Exception as e:
+            logger.error("MMEB cls '%s': %s", name, e)
+
+    # --- AllNLI triplets (native `negative` -> 1 HN per row) --------------
+    p = base / "allnli" / "train.jsonl"
+    if p.is_file():
+        parts.append(TextTripletDataset(str(p), "allnli", max_samples_per_subset))
+
+    # --- STS-B (CoSENT) ---------------------------------------------------
+    p = base / "stsb" / "train.jsonl"
+    if p.is_file():
+        parts.append(STSDataset(str(p)))
+
+    if not parts:
+        raise RuntimeError(f"No data under {data_dir} or {mined_dir}")
+
+    combined = ConcatDataset(parts)
+    logger.info("Stage2 total: %d examples from %d sources",
+                len(combined), len(parts))
     return combined

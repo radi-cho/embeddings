@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """Multimodal contrastive pretraining for Qwen3.5 / Qwen3-VL embedding models.
 
-DDP training with cross-GPU embedding gathering for contrastive loss.
-Two parallel forward passes (queries + positives) via CUDA streams,
-embeddings gathered across GPUs via GatherWithGrad for in-batch negatives.
+DDP training with cross-GPU embedding gathering for contrastive loss:
+  - Queries and positives are encoded on parallel CUDA streams.
+  - Optional hard negatives (classification wrong-class labels and/or mined
+    K negatives for retrieval/VQA) are encoded in the same no_sync context.
+  - Embeddings are gathered across ranks via GatherWithGrad, then routed to
+    per-task losses (InfoNCE stage 1/2, CoSENT, classification InfoNCE).
+  - OOM on any rank → all ranks skip the step in sync (no DDP deadlock).
+
+Stage toggle: --mined_dir set  =>  build_stage2_dataset (paper §4.3).
+              --mined_dir unset =>  build_mixed_dataset (full Stage-1 corpus).
 """
 
 import argparse
@@ -30,9 +37,13 @@ from transformers import get_cosine_schedule_with_warmup
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from train.dataset import build_dataloader, build_mixed_dataset, collate_embedding_batch
+from train.dataset import (
+    build_dataloader, build_mixed_dataset, build_stage2_dataset,
+    collate_embedding_batch,
+)
 from train.losses import (
-    cosent_loss, masked_infonce_loss, mrl_cosent_loss, mrl_infonce_loss,
+    classification_infonce_loss, cosent_loss, masked_infonce_loss,
+    mrl_classification_loss, mrl_cosent_loss, mrl_infonce_loss,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -165,17 +176,23 @@ class GatherWithGrad(torch.autograd.Function):
         return grad[_rank() * chunk : (_rank() + 1) * chunk]
 
 
+# Task-type <-> integer codec used by _gather_metadata's tensor all_gather
+# (avoids pickle overhead of all_gather_object).
+_TT_ENCODE = {"sts": 0, "classification": 2}
+_TT_DECODE = {0: "sts", 1: "other", 2: "classification"}
+
+
 def _gather_metadata(task_types, scores, device):
     """Gather task_types and scores across ranks via tensor ops (no pickle)."""
     if _world() == 1:
         return task_types, scores
     bs = len(task_types)
     tt_tensor = torch.tensor(
-        [0 if t == "sts" else 1 for t in task_types],
+        [_TT_ENCODE.get(t, 1) for t in task_types],
         device=device, dtype=torch.int32)
     tt_parts = [torch.zeros_like(tt_tensor) for _ in range(_world())]
     dist.all_gather(tt_parts, tt_tensor.contiguous())
-    g_tt = ["sts" if v == 0 else "other"
+    g_tt = [_TT_DECODE.get(v, "other")
             for v in torch.cat(tt_parts, dim=0).tolist()]
 
     local_scores = scores if scores is not None else torch.zeros(bs, device=device)
@@ -217,13 +234,81 @@ def _encode_batch(model, embedder, items, device):
 # Loss
 # ---------------------------------------------------------------------------
 
-def _compute_loss(q_emb, p_emb, task_types, scores, args):
+def _compute_loss(q_emb, p_emb, task_types, scores, args,
+                   q_local=None, p_local=None, local_task_types=None, hn_emb=None,
+                   mined_hn_local=None):
+    """Compute combined loss across three task groups.
+
+    Task routing (each group contributes 0..1 loss term; the final loss is
+    the mean of all contributing terms):
+
+      - classification : rank-local q_local/p_local + optional hn_emb (class labels)
+      - retrieval / VQA with mined HNs : rank-local q/p + mined_hn_local
+      - retrieval / VQA without mined HNs : gathered q/p (in-batch negatives)
+      - STS : gathered q/p + CoSENT (requires `scores`)
+
+    The rank-local paths are used for rows that carry their own row-aligned
+    negatives so the (B, K, D) layout remains well-defined. Everything else
+    uses cross-GPU-gathered embeddings for richer in-batch negatives.
+
+    Callers always pass q_local / p_local / local_task_types together, so
+    the per-rank branches can safely assume they are not None.
+    """
     mrl = args.mrl_dims if args.use_mrl else None
     device = q_emb.device
+
     sts_idx = [i for i, t in enumerate(task_types) if t == "sts"]
-    con_idx = [i for i, t in enumerate(task_types) if t != "sts"]
+    con_idx = [i for i, t in enumerate(task_types) if t not in ("sts", "classification")]
+
     losses = []
-    if con_idx:
+
+    # --- Classification: rank-local + optional wrong-class hard negatives ----
+    lcls_idx = [i for i, t in enumerate(local_task_types) if t == "classification"]
+    if lcls_idx:
+        lci = torch.tensor(lcls_idx, device=device)
+        q, p = q_local[lci], p_local[lci]
+        if hn_emb is not None and hn_emb.shape[0] > 0:
+            if mrl:
+                losses.append(mrl_classification_loss(
+                    q, p, hn_emb, mrl_dims=mrl, temperature=args.temperature))
+            else:
+                losses.append(classification_infonce_loss(
+                    F.normalize(q, dim=-1), F.normalize(p, dim=-1),
+                    F.normalize(hn_emb, dim=-1), temperature=args.temperature))
+        else:
+            # No wrong-class labels this batch — fall through to generic InfoNCE.
+            if mrl:
+                losses.append(mrl_infonce_loss(q, p, None, mrl_dims=mrl,
+                              temperature=args.temperature, stage=args.training_stage))
+            else:
+                losses.append(masked_infonce_loss(
+                    F.normalize(q, dim=-1), F.normalize(p, dim=-1), None,
+                    temperature=args.temperature, stage=args.training_stage))
+
+    # --- Retrieval / VQA with mined HNs: rank-local fast path ----------------
+    used_mined = False
+    if (mined_hn_local is not None and mined_hn_local.shape[0] > 0
+            and q_local is not None):
+        l_con_idx = [i for i, t in enumerate(local_task_types)
+                     if t not in ("sts", "classification")]
+        B_local = q_local.shape[0]
+        if l_con_idx and len(l_con_idx) == B_local \
+                and mined_hn_local.shape[0] % B_local == 0:
+            # Entire local batch is retrieval/VQA with uniform K — safe fast path.
+            if mrl:
+                losses.append(mrl_infonce_loss(q_local, p_local, mined_hn_local,
+                              mrl_dims=mrl, temperature=args.temperature,
+                              stage=args.training_stage))
+            else:
+                losses.append(masked_infonce_loss(
+                    F.normalize(q_local, dim=-1),
+                    F.normalize(p_local, dim=-1),
+                    F.normalize(mined_hn_local, dim=-1),
+                    temperature=args.temperature, stage=args.training_stage))
+            used_mined = True
+
+    # --- Retrieval / VQA without mined HNs: gathered InfoNCE -----------------
+    if con_idx and not used_mined:
         ci = torch.tensor(con_idx, device=device)
         q, p = q_emb[ci], p_emb[ci]
         if mrl:
@@ -233,6 +318,8 @@ def _compute_loss(q_emb, p_emb, task_types, scores, args):
             losses.append(masked_infonce_loss(
                 F.normalize(q, dim=-1), F.normalize(p, dim=-1), None,
                 temperature=args.temperature, stage=args.training_stage))
+
+    # --- STS: CoSENT loss ----------------------------------------------------
     if sts_idx and scores is not None:
         si = torch.tensor(sts_idx, device=device)
         q, p, s = q_emb[si], p_emb[si], scores[si]
@@ -242,6 +329,7 @@ def _compute_loss(q_emb, p_emb, task_types, scores, args):
         else:
             losses.append(cosent_loss(F.normalize(q, dim=-1),
                           F.normalize(p, dim=-1), s, temperature=args.temperature))
+
     if not losses:
         return torch.tensor(0.0, device=device, requires_grad=True)
     return sum(losses) / len(losses)
@@ -263,6 +351,20 @@ def _get_streams(device):
     return _stream_q, _stream_p
 
 
+def _hidden_size_from_model(model):
+    """Return hidden_size from a HF config, checking nested text_config for VLMs."""
+    cfg = model.module.config if hasattr(model, "module") else model.config
+    for attr in ("hidden_size", "d_model"):
+        v = getattr(cfg, attr, None)
+        if v:
+            return v
+    if hasattr(cfg, "text_config"):
+        v = getattr(cfg.text_config, "hidden_size", None)
+        if v:
+            return v
+    raise AttributeError(f"Cannot determine hidden_size from config: {type(cfg)}")
+
+
 def _train_step(embedder, model, device, batch, args):
     """DDP-safe training step with full OOM protection.
 
@@ -273,21 +375,13 @@ def _train_step(embedder, model, device, batch, args):
     """
     sq, sp = _get_streams(device)
     bs = len(batch["queries"])
-    hidden_dim = None
-    cfg = model.module.config if hasattr(model, "module") else model.config
-    for attr in ("hidden_size", "d_model"):
-        hidden_dim = getattr(cfg, attr, None)
-        if hidden_dim:
-            break
-    if hidden_dim is None and hasattr(cfg, "text_config"):
-        hidden_dim = getattr(cfg.text_config, "hidden_size", None)
-    if hidden_dim is None:
-        raise AttributeError(f"Cannot determine hidden_size from config: {type(cfg)}")
-
+    hidden_dim = _hidden_size_from_model(model)
     oom = False
 
     # --- Phase 1: forward encode (inside no_sync so no DDP hooks) ----------
     no_sync = model.no_sync if hasattr(model, "no_sync") else contextlib.nullcontext
+    hn_local = None
+    mined_hn_local = None
     with no_sync():
         try:
             with torch.cuda.stream(sq):
@@ -296,11 +390,32 @@ def _train_step(embedder, model, device, batch, args):
                 p_local = _encode_batch(model, embedder, batch["positives"], device)
             sq.synchronize()
             sp.synchronize()
+
+            neg_texts = batch.get("negative_texts")
+            if neg_texts is not None:
+                cls_mask = [t == "classification" for t in batch["task_types"]]
+                neg_items = []
+                for i, is_cls in enumerate(cls_mask):
+                    if is_cls and neg_texts[i]:
+                        for t in neg_texts[i]:
+                            neg_items.append({"text": t, "instruction": "Represent the label."})
+                if neg_items:
+                    hn_local = _encode_batch(model, embedder, neg_items, device)
+
+            # Mined hard-negatives: collate guarantees uniform K across the
+            # batch, so we flatten row-major: [row0.hn0..hnK, row1.hn0..hnK, ...]
+            mined_hns = batch.get("hard_negatives")
+            if mined_hns and all(len(h) > 0 for h in mined_hns):
+                flat = [h for row in mined_hns for h in row]
+                if flat:
+                    mined_hn_local = _encode_batch(model, embedder, flat, device)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             oom = True
             q_local = torch.zeros(bs, hidden_dim, device=device, dtype=torch.bfloat16)
             p_local = torch.zeros(bs, hidden_dim, device=device, dtype=torch.bfloat16)
+            hn_local = None
+            mined_hn_local = None
             logger.warning("OOM during forward on rank %d", _rank())
 
     q = GatherWithGrad.apply(q_local) if _world() > 1 else q_local
@@ -315,7 +430,10 @@ def _train_step(embedder, model, device, batch, args):
     # --- Phase 2: loss + backward (still no DDP sync — manual reduce after) -
     scores = batch["scores"].to(device) if batch["scores"] is not None else None
     g_tt, g_scores = _gather_metadata(batch["task_types"], scores, device)
-    loss = _compute_loss(q, p, g_tt, g_scores, args)
+    loss = _compute_loss(q, p, g_tt, g_scores, args,
+                         q_local=q_local, p_local=p_local,
+                         local_task_types=batch["task_types"], hn_emb=hn_local,
+                         mined_hn_local=mined_hn_local)
     loss_val = loss.detach().float().item()
 
     with no_sync():
@@ -437,19 +555,31 @@ def _load_ckpt(accelerator, args, resume_dir):
 def _build_dataloader(args, embedder, batch_size):
     subsets = args.subsets.split(",") if args.subsets else None
     tt_filter = args.task_types.split(",") if args.task_types else None
-    if args.data_dir:
+
+    # Without a data_dir root we fall back to the legacy MMEB-only builder.
+    if not args.data_dir:
+        return build_dataloader(
+            subsets=subsets, task_types=tt_filter, split=args.dataset_split,
+            image_dir=args.image_dir, max_samples_per_subset=args.max_samples_per_subset,
+            cache_dir=args.cache_dir,
+            batch_size=batch_size, num_workers=args.num_workers, shuffle=True)
+
+    # Stage 2 (mined HNs) vs Stage 1 (full mixed corpus) is decided by
+    # whether --mined_dir is set.
+    if args.mined_dir:
+        dataset = build_stage2_dataset(
+            data_dir=args.data_dir, mined_dir=args.mined_dir,
+            image_dir=args.image_dir,
+            mmeb_split=args.dataset_split,
+            max_samples_per_subset=args.max_samples_per_subset,
+            cache_dir=args.cache_dir)
+    else:
         dataset = build_mixed_dataset(
             data_dir=args.data_dir, image_dir=args.image_dir,
             megapairs_image_dir=args.megapairs_image_dir,
             mmeb_split=args.dataset_split,
             max_samples_per_subset=args.max_samples_per_subset,
             cache_dir=args.cache_dir)
-    else:
-        return build_dataloader(
-            subsets=subsets, task_types=tt_filter, split=args.dataset_split,
-            image_dir=args.image_dir, max_samples_per_subset=args.max_samples_per_subset,
-            cache_dir=args.cache_dir,
-            batch_size=batch_size, num_workers=args.num_workers, shuffle=True)
 
     from torch.utils.data import DistributedSampler
     sampler = DistributedSampler(dataset, num_replicas=_world(),
@@ -611,6 +741,8 @@ def main():
     p.add_argument("--lora_dropout", type=float, default=0.05)
     p.add_argument("--gradient_checkpointing", action="store_true")
     p.add_argument("--data_dir", default=None)
+    p.add_argument("--mined_dir", default=None,
+                   help="If set, use build_mixed_dataset_mined with this dir of mined JSONLs")
     p.add_argument("--image_dir", default=None)
     p.add_argument("--megapairs_image_dir", default=None)
     p.add_argument("--dataset_split", default="diverse_instruction")
