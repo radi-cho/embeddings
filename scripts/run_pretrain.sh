@@ -17,34 +17,36 @@ if [[ -z "${HF_TOKEN:-}" && -f "${ROOT}/.hf_token_local" ]]; then
 ' < "${ROOT}/.hf_token_local")"
 fi
 
-: "${CUDA_DEVICES:=0,1}"
+: "${CUDA_DEVICES:=0,1,2,3,4,5,6,7}"
 : "${MODEL_PATH:=${ROOT}/models/checkpoints/Qwen3.5-0.8B}"
-: "${OUTPUT_DIR:=/data/outputs/qwen35-0.8b-10M-pretrain}"
+: "${OUTPUT_DIR:=/data/outputs/qwen35-0.8b-10M-pretrain-lr1e4-a64}"
 : "${IMAGE_DIR:=${ROOT}/datasets/mmeb_train_images/images}"
 : "${MEGAPAIRS_IMAGE_DIR:=/home/jupyter/shared/megapairs_images}"
 : "${DATA_DIR:=/data/training_data}"
 
-: "${BATCH_SIZE:=48}"
+: "${BATCH_SIZE:=64}"
 : "${GRAD_ACCUM:=1}"
 : "${EPOCHS:=1}"
-: "${LR:=2e-5}"
+: "${LR:=1e-4}"
 : "${TEMPERATURE:=0.02}"
 : "${MAX_LENGTH:=512}"
 : "${MAX_PIXELS:=1310720}"
 : "${TRAINING_STAGE:=1}"
 : "${MRL_DIMS:=1024,256,64}"
 : "${LORA_RANK:=32}"
-: "${LORA_ALPHA:=32}"
+: "${LORA_ALPHA:=64}"
 : "${SAVE_STEPS:=500}"
 : "${LOG_INTERVAL:=1}"
-: "${NUM_WORKERS:=4}"
+: "${NUM_WORKERS:=8}"
+: "${PREFETCH_FACTOR:=4}"
 : "${SEED:=42}"
 : "${GRADIENT_CHECKPOINTING:=true}"
+: "${COMPILE:=false}"
 
 : "${USE_WANDB:=true}"
 : "${WANDB_PROJECT:=embeddings}"
 : "${WANDB_ENTITY:=radi-and-people}"
-: "${WANDB_RUN_NAME:=qwen35-0.8b-10M-pretrain-bs48-fla-fused}"
+: "${WANDB_RUN_NAME:=qwen35-0.8b-10M-lr1e4-alpha64-8xH100}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -73,7 +75,7 @@ ARGS="--model_path ${MODEL_PATH} --output_dir ${OUTPUT_DIR} \
     --max_length ${MAX_LENGTH} --max_pixels ${MAX_PIXELS} \
     --training_stage ${TRAINING_STAGE} --use_mrl --mrl_dims ${MRL_DIMS} \
     --lora_rank ${LORA_RANK} --lora_alpha ${LORA_ALPHA} \
-    --num_workers ${NUM_WORKERS} --seed ${SEED} \
+    --num_workers ${NUM_WORKERS} --prefetch_factor ${PREFETCH_FACTOR} --seed ${SEED} \
     --save_steps ${SAVE_STEPS} --log_interval ${LOG_INTERVAL}"
 
 [ -n "${IMAGE_DIR:-}" ]    && ARGS="${ARGS} --image_dir ${IMAGE_DIR}"
@@ -83,6 +85,8 @@ ARGS="--model_path ${MODEL_PATH} --output_dir ${OUTPUT_DIR} \
 [ -n "${TASK_TYPES:-}" ]   && ARGS="${ARGS} --task_types ${TASK_TYPES}"
 [ -n "${MAX_SAMPLES:-}" ]  && ARGS="${ARGS} --max_samples_per_subset ${MAX_SAMPLES}"
 [ "${GRADIENT_CHECKPOINTING}" = "true" ] && ARGS="${ARGS} --gradient_checkpointing"
+[ "${COMPILE}" = "true" ] && ARGS="${ARGS} --compile"
+[ -n "${RESUME_FROM:-}" ] && ARGS="${ARGS} --resume_from ${RESUME_FROM}"
 if [ "${USE_WANDB}" = "true" ]; then
     ARGS="${ARGS} --use_wandb --wandb_project ${WANDB_PROJECT}"
     [ -n "${WANDB_ENTITY:-}" ]   && ARGS="${ARGS} --wandb_entity ${WANDB_ENTITY}"

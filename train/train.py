@@ -7,14 +7,17 @@ embeddings gathered across GPUs via GatherWithGrad for in-batch negatives.
 """
 
 import argparse
+import contextlib
 import json
 import logging
 import os
+import random as _random
 import sys
 import time
 from datetime import timedelta
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -72,7 +75,16 @@ def _patch_gdn_bf16():
                     x=mixed_qkv, weight=self.conv1d.weight.squeeze(1),
                     bias=self.conv1d.bias, activation=self.activation, seq_idx=None)
             else:
-                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+                _INT32_MAX = 2**31 - 1
+                if mixed_qkv.numel() > _INT32_MAX:
+                    chunks = []
+                    cs = max(1, batch_size // 2)
+                    for s in range(0, batch_size, cs):
+                        c = mixed_qkv[s:s + cs]
+                        chunks.append(F.silu(self.conv1d(c)[:, :, :seq_len]))
+                    mixed_qkv = torch.cat(chunks, dim=0)
+                else:
+                    mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(mixed_qkv,
@@ -154,14 +166,18 @@ class GatherWithGrad(torch.autograd.Function):
 
 
 def _gather_metadata(task_types, scores, device):
-    """Gather task_types and scores across ranks.
-    Always executes the same collectives on every rank to prevent deadlocks."""
+    """Gather task_types and scores across ranks via tensor ops (no pickle)."""
     if _world() == 1:
         return task_types, scores
-    all_tt = [None] * _world()
-    dist.all_gather_object(all_tt, list(task_types))
-    g_tt = [t for sub in all_tt for t in sub]
     bs = len(task_types)
+    tt_tensor = torch.tensor(
+        [0 if t == "sts" else 1 for t in task_types],
+        device=device, dtype=torch.int32)
+    tt_parts = [torch.zeros_like(tt_tensor) for _ in range(_world())]
+    dist.all_gather(tt_parts, tt_tensor.contiguous())
+    g_tt = ["sts" if v == 0 else "other"
+            for v in torch.cat(tt_parts, dim=0).tolist()]
+
     local_scores = scores if scores is not None else torch.zeros(bs, device=device)
     parts = [torch.zeros_like(local_scores) for _ in range(_world())]
     dist.all_gather(parts, local_scores.contiguous())
@@ -248,26 +264,88 @@ def _get_streams(device):
 
 
 def _train_step(embedder, model, device, batch, args):
+    """DDP-safe training step with full OOM protection.
+
+    Uses model.no_sync() so DDP gradient hooks don't fire during backward
+    (preventing deadlock if one rank OOMs mid-backward). Gradients are
+    manually all-reduced after a successful backward on all ranks.
+    Returns loss float, or None if any rank OOMed at any phase.
+    """
     sq, sp = _get_streams(device)
+    bs = len(batch["queries"])
+    hidden_dim = None
+    cfg = model.module.config if hasattr(model, "module") else model.config
+    for attr in ("hidden_size", "d_model"):
+        hidden_dim = getattr(cfg, attr, None)
+        if hidden_dim:
+            break
+    if hidden_dim is None and hasattr(cfg, "text_config"):
+        hidden_dim = getattr(cfg.text_config, "hidden_size", None)
+    if hidden_dim is None:
+        raise AttributeError(f"Cannot determine hidden_size from config: {type(cfg)}")
 
-    with torch.cuda.stream(sq):
-        q_local = _encode_batch(model, embedder, batch["queries"], device)
+    oom = False
 
-    with torch.cuda.stream(sp):
-        p_local = _encode_batch(model, embedder, batch["positives"], device)
+    # --- Phase 1: forward encode (inside no_sync so no DDP hooks) ----------
+    no_sync = model.no_sync if hasattr(model, "no_sync") else contextlib.nullcontext
+    with no_sync():
+        try:
+            with torch.cuda.stream(sq):
+                q_local = _encode_batch(model, embedder, batch["queries"], device)
+            with torch.cuda.stream(sp):
+                p_local = _encode_batch(model, embedder, batch["positives"], device)
+            sq.synchronize()
+            sp.synchronize()
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            oom = True
+            q_local = torch.zeros(bs, hidden_dim, device=device, dtype=torch.bfloat16)
+            p_local = torch.zeros(bs, hidden_dim, device=device, dtype=torch.bfloat16)
+            logger.warning("OOM during forward on rank %d", _rank())
 
-    sq.synchronize()
     q = GatherWithGrad.apply(q_local) if _world() > 1 else q_local
-
-    sp.synchronize()
     p = GatherWithGrad.apply(p_local) if _world() > 1 else p_local
 
+    oom_flag = torch.tensor([1.0 if oom else 0.0], device=device)
+    if _world() > 1:
+        dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX)
+    if oom_flag.item() > 0:
+        return None
+
+    # --- Phase 2: loss + backward (still no DDP sync — manual reduce after) -
     scores = batch["scores"].to(device) if batch["scores"] is not None else None
     g_tt, g_scores = _gather_metadata(batch["task_types"], scores, device)
-
     loss = _compute_loss(q, p, g_tt, g_scores, args)
-    loss.backward()
-    return loss.detach().float().item()
+    loss_val = loss.detach().float().item()
+
+    with no_sync():
+        try:
+            loss.backward()
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            oom = True
+            logger.warning("OOM during backward on rank %d", _rank())
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad.zero_()
+
+    oom_flag.fill_(1.0 if oom else 0.0)
+    if _world() > 1:
+        dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX)
+    if oom_flag.item() > 0:
+        for param in model.parameters():
+            if param.grad is not None:
+                param.grad.zero_()
+        return None
+
+    # --- Phase 3: manual gradient all-reduce (all ranks healthy) -----------
+    if _world() > 1:
+        for param in model.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+                param.grad.div_(_world())
+
+    return loss_val
 
 
 # ---------------------------------------------------------------------------
@@ -302,15 +380,58 @@ def _load_embedder(model_path, max_length, model_type, max_pixels=None,
                           torch_dtype=torch.bfloat16, max_length=max_length, **kw)
 
 
-def _save_ckpt(accelerator, embedder, args, step, final=False):
-    if not accelerator.is_main_process:
-        return
+def _save_ckpt(accelerator, embedder, args, step, optimizer=None,
+               scheduler=None, epoch=0, epoch_loss=0.0, epoch_steps=0, final=False):
     d = Path(args.output_dir) / ("final" if final else f"checkpoint-{step}")
     accelerator.print(f"Saving to {d}")
+    if accelerator.is_main_process:
+        d.mkdir(parents=True, exist_ok=True)
+    accelerator.wait_for_everyone()
+
     accelerator.unwrap_model(embedder.model).save_pretrained(d)
-    tok = getattr(embedder, "processor", None) or getattr(embedder, "tokenizer", None)
-    if tok:
-        tok.save_pretrained(d)
+    if accelerator.is_main_process:
+        tok = getattr(embedder, "processor", None) or getattr(embedder, "tokenizer", None)
+        if tok:
+            tok.save_pretrained(d)
+
+    train_state = {
+        "global_step": step,
+        "epoch": epoch,
+        "epoch_loss": epoch_loss,
+        "epoch_steps": epoch_steps,
+    }
+    state_dir = d / "train_state"
+    accelerator.save_state(state_dir)
+    if accelerator.is_main_process:
+        torch.save(train_state, state_dir / "extra_state.pt")
+        rng = {
+            "python": _random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.random.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            rng["cuda"] = torch.cuda.get_rng_state_all()
+        torch.save(rng, state_dir / "rng_states.pt")
+    accelerator.wait_for_everyone()
+
+
+def _load_ckpt(accelerator, args, resume_dir):
+    """Restore optimizer, scheduler, RNG, and training counters from checkpoint."""
+    state_dir = Path(resume_dir) / "train_state"
+    if not state_dir.exists():
+        raise FileNotFoundError(f"No train_state in {resume_dir}")
+    accelerator.load_state(state_dir)
+    extra = torch.load(state_dir / "extra_state.pt", map_location="cpu", weights_only=True)
+    rng_path = state_dir / "rng_states.pt"
+    if rng_path.exists():
+        rng = torch.load(rng_path, map_location="cpu", weights_only=False)
+        _random.setstate(rng["python"])
+        np.random.set_state(rng["numpy"])
+        torch.random.set_rng_state(rng["torch"])
+        if torch.cuda.is_available() and "cuda" in rng:
+            torch.cuda.set_rng_state_all(rng["cuda"])
+    accelerator.print(f"Resumed from {resume_dir} at step {extra['global_step']}")
+    return extra
 
 
 def _build_dataloader(args, embedder, batch_size):
@@ -338,7 +459,7 @@ def _build_dataloader(args, embedder, batch_size):
                       collate_fn=collate_embedding_batch,
                       num_workers=args.num_workers, drop_last=True,
                       pin_memory=True, persistent_workers=args.num_workers > 0,
-                      prefetch_factor=2 if args.num_workers > 0 else None)
+                      prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None)
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +502,10 @@ def train(args):
         embedder.model.enable_input_require_grads()
         embedder.model.gradient_checkpointing_enable()
 
+    if args.compile:
+        accelerator.print("Compiling model with torch.compile ...")
+        embedder.model = torch.compile(embedder.model)
+
     world = accelerator.num_processes
     bs = args.batch_size
     effective_bs = bs * world * args.gradient_accumulation_steps
@@ -401,27 +526,42 @@ def train(args):
     accelerator.print(f"  Steps: {total_steps} ({len(dataloader)}/epoch), warmup={warmup}")
 
     global_step = 0
+    start_epoch = 0
+    epoch_loss_init, epoch_steps_init = 0.0, 0
+    if args.resume_from:
+        extra = _load_ckpt(accelerator, args, args.resume_from)
+        global_step = extra["global_step"]
+        start_epoch = extra["epoch"]
+        epoch_loss_init = extra.get("epoch_loss", 0.0)
+        epoch_steps_init = extra.get("epoch_steps", 0)
+
     embedder.model.train()
-    for epoch in range(args.epochs):
-        epoch_loss, epoch_steps, t0 = 0.0, 0, time.time()
+    for epoch in range(start_epoch, args.epochs):
+        epoch_loss = epoch_loss_init if epoch == start_epoch else 0.0
+        epoch_steps = epoch_steps_init if epoch == start_epoch else 0
+        t0 = time.time()
         for attr in ('batch_sampler', 'sampler'):
             s = getattr(dataloader, attr, None)
             if s and hasattr(s, 'set_epoch'):
                 s.set_epoch(epoch)
                 break
-        for batch in dataloader:
+        steps_to_skip = epoch_steps_init if epoch == start_epoch else 0
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx < steps_to_skip:
+                continue
             optimizer.zero_grad()
-            try:
-                step_loss = _train_step(
-                    embedder, embedder.model, accelerator.device, batch, args)
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                logger.warning("OOM at step %d, skipping batch", global_step + 1)
+            step_loss = _train_step(
+                embedder, embedder.model, accelerator.device, batch, args)
+
+            if step_loss is None:
                 optimizer.zero_grad()
                 scheduler.step()
                 epoch_steps += 1
                 global_step += 1
+                if accelerator.is_main_process:
+                    logger.warning("Skipping step %d (OOM on >= 1 rank)", global_step)
                 continue
+
             torch.nn.utils.clip_grad_norm_(
                 embedder.model.parameters(), args.max_grad_norm)
             optimizer.step()
@@ -443,11 +583,15 @@ def train(args):
                                      "train/samples_per_sec": sps}, step=global_step)
 
             if args.save_steps > 0 and global_step % args.save_steps == 0:
-                _save_ckpt(accelerator, embedder, args, global_step)
+                _save_ckpt(accelerator, embedder, args, global_step,
+                           optimizer=optimizer, scheduler=scheduler,
+                           epoch=epoch, epoch_loss=epoch_loss, epoch_steps=epoch_steps)
 
         accelerator.print(f"Epoch {epoch} done. Loss: {epoch_loss / max(epoch_steps, 1):.4f}")
 
-    _save_ckpt(accelerator, embedder, args, global_step, final=True)
+    _save_ckpt(accelerator, embedder, args, global_step,
+               optimizer=optimizer, scheduler=scheduler,
+               epoch=epoch, epoch_loss=epoch_loss, epoch_steps=epoch_steps, final=True)
     if args.use_wandb and accelerator.is_main_process:
         accelerator.end_training()
     accelerator.print("Done.")
@@ -457,6 +601,8 @@ def main():
     p = argparse.ArgumentParser(description="Multimodal contrastive pretraining")
     p.add_argument("--model_path", required=True)
     p.add_argument("--output_dir", default="outputs/qwen35-embedding-train")
+    p.add_argument("--resume_from", default=None,
+                   help="Checkpoint dir to resume from (restores optimizer, scheduler, RNG, step)")
     p.add_argument("--max_length", type=int, default=512)
     p.add_argument("--max_pixels", type=int, default=1310720)
     p.add_argument("--video_total_pixels", type=int, default=9216000)
@@ -473,6 +619,7 @@ def main():
     p.add_argument("--max_samples_per_subset", type=int, default=None)
     p.add_argument("--cache_dir", default=None)
     p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--prefetch_factor", type=int, default=4)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--epochs", type=int, default=1)
@@ -486,6 +633,8 @@ def main():
     p.add_argument("--use_mrl", action="store_true", default=True)
     p.add_argument("--no_mrl", action="store_true")
     p.add_argument("--mrl_dims", default="1024,256,64")
+    p.add_argument("--compile", action="store_true",
+                   help="torch.compile the model before training")
     p.add_argument("--log_interval", type=int, default=1)
     p.add_argument("--save_steps", type=int, default=200)
     p.add_argument("--use_wandb", action="store_true")
