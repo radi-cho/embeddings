@@ -620,12 +620,30 @@ def train(args):
 
     mt = _detect_model_type(args.model_path)
     accelerator.print(f"Loading {args.model_path} (type={mt})")
-    embedder = _load_embedder(args.model_path, args.max_length, mt, args.max_pixels,
-                              args.video_total_pixels)
-    embedder.model = get_peft_model(embedder.model, LoraConfig(
-        task_type=TaskType.FEATURE_EXTRACTION, r=args.lora_rank,
-        lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
-        target_modules=LORA_TARGETS[mt]))
+    is_lora_checkpoint = (Path(args.model_path) / "adapter_config.json").exists()
+    if is_lora_checkpoint:
+        with open(Path(args.model_path) / "adapter_config.json") as f:
+            adapter_cfg = json.load(f)
+        base_model_path = adapter_cfg.get("base_model_name_or_path")
+        if not base_model_path or not Path(base_model_path).exists():
+            raise RuntimeError(
+                f"Cannot resolve base_model_name_or_path={base_model_path!r} "
+                f"from {args.model_path}/adapter_config.json. "
+                f"Merge the LoRA adapter first or fix the path.")
+        accelerator.print(f"  LoRA adapter detected; loading base model from {base_model_path}")
+        embedder = _load_embedder(base_model_path, args.max_length, mt, args.max_pixels,
+                                  args.video_total_pixels)
+        from peft import PeftModel
+        embedder.model = PeftModel.from_pretrained(
+            embedder.model, args.model_path, is_trainable=True)
+        accelerator.print("  Loaded LoRA adapter weights from checkpoint (trainable)")
+    else:
+        embedder = _load_embedder(args.model_path, args.max_length, mt, args.max_pixels,
+                                  args.video_total_pixels)
+        embedder.model = get_peft_model(embedder.model, LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION, r=args.lora_rank,
+            lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+            target_modules=LORA_TARGETS[mt]))
     if accelerator.is_main_process:
         embedder.model.print_trainable_parameters()
     if args.gradient_checkpointing:
