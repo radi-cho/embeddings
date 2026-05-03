@@ -1,0 +1,37 @@
+---
+description: Data disk mounting instructions for the 2.5 TB disk on this VM
+alwaysApply: true
+---
+
+# Data Disk Mount
+
+This VM has a 2.5 TB data disk (`/dev/sdb`, ext4) that holds project data.
+
+## Layout
+
+- The disk is auto-mounted by the system at `/home/jupyter`
+- The shared project data lives at `/home/jupyter/shared/`
+- The Cursor workspace is `/home/shared`
+
+## Problem
+
+`/home/shared` is an empty directory on the root filesystem — it is **not** the same as `/home/jupyter/shared/`. Without a bind mount, paths like `/home/shared/embeddings/...` won't resolve.
+
+## Fix — run once per boot
+
+```bash
+sudo mount --bind /home/jupyter/shared /home/shared
+```
+
+This is already in `/etc/fstab`, so it should survive reboots. If it somehow doesn't take effect, run the command above.
+
+## How to detect this issue
+
+If files or directories under `/home/shared` are missing or `/home/shared` appears empty despite the disk being present, check:
+
+```bash
+df -h /home/shared        # should show /dev/sdb ~2.5T
+ls /home/jupyter/shared/  # should contain the actual data
+```
+
+If `df` shows `/home/shared` on `/dev/sda1` (the root disk), the bind mount is missing — apply the fix above.
