@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="${ROOT}/.venv/bin/python"
 BASE_MODEL="${ROOT}/models/checkpoints/Qwen3.5-0.8B"
-CKPT_DIR="/data/outputs/qwen35-0.8b-10M-pretrain-lr1e4-a64"
+CKPT_DIR="${ROOT}/data/outputs/stage1-lr1e4-a64"
 RESULTS_BASE="${ROOT}/results/mmeb-v6-checkpoints"
 
 CHECKPOINTS=(500 3000 6000 9000 12000 15000 17500)

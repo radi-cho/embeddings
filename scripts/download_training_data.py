@@ -8,7 +8,7 @@ Multimodal sources -> HF Arrow datasets (save_to_disk) or JSONL
 Video sources      -> JSONL manifests (frames downloaded separately)
 MMEB images        -> Extracted per-subset image directories
 
-All output goes to --output_dir (default /data/training_data/).
+All output goes to --output_dir (default: data/training_data/ under the project root).
 Each source gets its own subdirectory with a manifest.json.
 
 Uses HF_TOKEN from .hf_token_local for gated datasets.
@@ -353,7 +353,8 @@ def download_mmeb_images(out_dir: Path, subsets: list[str] | None = None,
 
 def main():
     p = argparse.ArgumentParser(description="Download ~10M mixed training data")
-    p.add_argument("--output_dir", default="/data/training_data")
+    _project_root = str(Path(__file__).resolve().parents[1])
+    p.add_argument("--output_dir", default=os.path.join(_project_root, "data", "training_data"))
     p.add_argument("--msmarco_max", type=int, default=3_000_000)
     p.add_argument("--gooaq_max", type=int, default=3_000_000)
     p.add_argument("--megapairs_max", type=int, default=5_000_000)

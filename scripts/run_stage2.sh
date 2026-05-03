@@ -2,8 +2,8 @@
 # Stage 2 training with K=15 mined hard negatives (Qwen3-VL paper methodology).
 #
 # Prerequisites:
-#   - Stage 1 LoRA checkpoint at /data/outputs/qwen35-0.8b-10M-pretrain-lr1e4-a64/checkpoint-15000
-#   - Mined JSONL files in /data/training_data_mined/ (produced by scripts/mine_hard_negatives.py)
+#   - Stage 1 LoRA checkpoint at ${ROOT}/data/outputs/stage1-lr1e4-a64/checkpoint-15000
+#   - Mined JSONL files in ${ROOT}/data/training_data_mined/ (produced by scripts/mine_hard_negatives.py)
 #
 # Data routing (per task_type):
 #   sts            -> CoSENT loss (STS-B, symmetric)
@@ -26,11 +26,11 @@ fi
 
 # ---- Paths ----
 : "${CUDA_DEVICES:=0,1,2,3,4,5,6,7}"
-: "${MODEL_PATH:=/data/outputs/qwen35-0.8b-10M-pretrain-lr1e4-a64/checkpoint-15000}"
-: "${OUTPUT_DIR:=/data/outputs/qwen35-0.8b-stage2-k15}"
+: "${MODEL_PATH:=${ROOT}/data/outputs/stage1-lr1e4-a64/checkpoint-15000}"
+: "${OUTPUT_DIR:=${ROOT}/data/outputs/stage2-k15}"
 : "${IMAGE_DIR:=${ROOT}/datasets/mmeb_train_images/images}"
-: "${DATA_DIR:=/data/training_data}"
-: "${MINED_DIR:=/data/training_data_mined}"
+: "${DATA_DIR:=${ROOT}/data/training_data}"
+: "${MINED_DIR:=${ROOT}/data/training_data_mined}"
 
 # ---- Optimizer / schedule ----
 : "${BATCH_SIZE:=32}"          # Halved from Stage 1 (K=15 HNs triple forward cost)

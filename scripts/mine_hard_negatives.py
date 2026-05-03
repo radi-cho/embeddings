@@ -13,7 +13,7 @@ For each dataset:
   5. faiss.IndexFlatIP on CPU, top-K=50 inner-product search.
   6. Filter: keep candidates where cos(q,c) < cos(q,pos) + 0.1 and c != positive,
      take first K=15; if <15 pass the margin, pad with next-best up to 30.
-  7. Write JSONL line-by-line to /data/training_data_mined/<name>.jsonl.
+  7. Write JSONL line-by-line to data/training_data_mined/<name>.jsonl.
   8. Emit ONE "[mine] ..." summary line.
 
 When all requested datasets are done: touch /tmp/mining_complete.sentinel.
@@ -45,12 +45,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # Constants
 # --------------------------------------------------------------------------
 
-DEFAULT_MODEL = "/data/outputs/qwen35-0.8b-10M-pretrain-lr1e4-a64/merged-15000"
-BASE_MODEL = "/home/shared/embeddings/models/checkpoints/Qwen3.5-0.8B"
-STAGE1_CKPT = "/data/outputs/qwen35-0.8b-10M-pretrain-lr1e4-a64/checkpoint-15000"
-OUT_DIR = Path("/data/training_data_mined")
-DATA_DIR = Path("/data/training_data")
-IMAGE_DIR = Path("/home/shared/embeddings/datasets/mmeb_train_images/images")
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+DEFAULT_MODEL = str(_PROJECT_ROOT / "data/outputs/stage1-lr1e4-a64/merged-15000")
+BASE_MODEL = str(_PROJECT_ROOT / "models/checkpoints/Qwen3.5-0.8B")
+STAGE1_CKPT = str(_PROJECT_ROOT / "data/outputs/stage1-lr1e4-a64/checkpoint-15000")
+OUT_DIR = _PROJECT_ROOT / "data/training_data_mined"
+DATA_DIR = _PROJECT_ROOT / "data/training_data"
+IMAGE_DIR = _PROJECT_ROOT / "datasets/mmeb_train_images/images"
 SENTINEL = Path("/tmp/mining_complete.sentinel")
 
 FALSE_NEG_MARGIN = 0.1
