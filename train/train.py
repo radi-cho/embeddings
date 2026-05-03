@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from train.dataset import (
     build_dataloader, build_mixed_dataset, build_stage2_dataset,
-    collate_embedding_batch,
+    collate_embedding_batch, TaskStratifiedSampler,
 )
 from train.losses import (
     classification_infonce_loss, cosent_loss, masked_infonce_loss,
@@ -236,90 +236,98 @@ def _encode_batch(model, embedder, items, device):
 
 def _compute_loss(q_emb, p_emb, task_types, scores, args,
                    q_local=None, p_local=None, local_task_types=None, hn_emb=None,
-                   mined_hn_local=None):
-    """Compute combined loss across three task groups.
+                   mined_hn_gathered=None):
+    """Compute training loss with stage-dependent task routing.
 
-    Task routing (each group contributes 0..1 loss term; the final loss is
-    the mean of all contributing terms):
+    Stage 1 (paper §4.1): plain InfoNCE (Eq. 1) for ALL data, including
+    classification. STS rows use CoSENT. No task-specific loss routing.
 
-      - classification : rank-local q_local/p_local + optional hn_emb (class labels)
-      - retrieval / VQA with mined HNs : rank-local q/p + mined_hn_local
-      - retrieval / VQA without mined HNs : gathered q/p (in-batch negatives)
-      - STS : gathered q/p + CoSENT (requires `scores`)
+    Stage 2 (paper §4.2): per-task-type routing:
+      - classification → classification_infonce_loss (wrong-class labels only)
+      - retrieval/VQA → InfoNCE stage=2 + gathered mined hard negatives
+      - STS → CoSENT
 
-    The rank-local paths are used for rows that carry their own row-aligned
-    negatives so the (B, K, D) layout remains well-defined. Everything else
-    uses cross-GPU-gathered embeddings for richer in-batch negatives.
-
-    Callers always pass q_local / p_local / local_task_types together, so
-    the per-rank branches can safely assume they are not None.
+    The final loss is the mean of all contributing terms.
     """
     mrl = args.mrl_dims if args.use_mrl else None
     device = q_emb.device
+    stage = args.training_stage
 
     sts_idx = [i for i, t in enumerate(task_types) if t == "sts"]
-    con_idx = [i for i, t in enumerate(task_types) if t not in ("sts", "classification")]
-
     losses = []
 
-    # --- Classification: rank-local + optional wrong-class hard negatives ----
-    lcls_idx = [i for i, t in enumerate(local_task_types) if t == "classification"]
-    if lcls_idx:
-        lci = torch.tensor(lcls_idx, device=device)
-        q, p = q_local[lci], p_local[lci]
-        if hn_emb is not None and hn_emb.shape[0] > 0:
-            if mrl:
-                losses.append(mrl_classification_loss(
-                    q, p, hn_emb, mrl_dims=mrl, temperature=args.temperature))
-            else:
-                losses.append(classification_infonce_loss(
-                    F.normalize(q, dim=-1), F.normalize(p, dim=-1),
-                    F.normalize(hn_emb, dim=-1), temperature=args.temperature))
-        else:
-            # No wrong-class labels this batch — fall through to generic InfoNCE.
+    # =======================================================================
+    # Stage 1: everything (except STS) gets plain InfoNCE on gathered q/p
+    # =======================================================================
+    if stage == 1:
+        non_sts_idx = [i for i, t in enumerate(task_types) if t != "sts"]
+        if non_sts_idx:
+            ci = torch.tensor(non_sts_idx, device=device)
+            q, p = q_emb[ci], p_emb[ci]
             if mrl:
                 losses.append(mrl_infonce_loss(q, p, None, mrl_dims=mrl,
-                              temperature=args.temperature, stage=args.training_stage))
+                              temperature=args.temperature, stage=1))
             else:
                 losses.append(masked_infonce_loss(
                     F.normalize(q, dim=-1), F.normalize(p, dim=-1), None,
-                    temperature=args.temperature, stage=args.training_stage))
+                    temperature=args.temperature, stage=1))
 
-    # --- Retrieval / VQA with mined HNs: rank-local fast path ----------------
-    used_mined = False
-    if (mined_hn_local is not None and mined_hn_local.shape[0] > 0
-            and q_local is not None):
-        l_con_idx = [i for i, t in enumerate(local_task_types)
-                     if t not in ("sts", "classification")]
-        B_local = q_local.shape[0]
-        if l_con_idx and len(l_con_idx) == B_local \
-                and mined_hn_local.shape[0] % B_local == 0:
-            # Entire local batch is retrieval/VQA with uniform K — safe fast path.
+    # =======================================================================
+    # Stage 2: per-task-type routing with hard negatives
+    # =======================================================================
+    else:
+        con_idx = [i for i, t in enumerate(task_types)
+                   if t not in ("sts", "classification")]
+
+        # Classification: rank-local + optional wrong-class hard negatives
+        lcls_idx = [i for i, t in enumerate(local_task_types)
+                    if t == "classification"]
+        if lcls_idx:
+            lci = torch.tensor(lcls_idx, device=device)
+            q, p = q_local[lci], p_local[lci]
+            if hn_emb is not None and hn_emb.shape[0] > 0:
+                if mrl:
+                    losses.append(mrl_classification_loss(
+                        q, p, hn_emb, mrl_dims=mrl, temperature=args.temperature))
+                else:
+                    losses.append(classification_infonce_loss(
+                        F.normalize(q, dim=-1), F.normalize(p, dim=-1),
+                        F.normalize(hn_emb, dim=-1), temperature=args.temperature))
+            else:
+                if mrl:
+                    losses.append(mrl_infonce_loss(q, p, None, mrl_dims=mrl,
+                                  temperature=args.temperature, stage=stage))
+                else:
+                    losses.append(masked_infonce_loss(
+                        F.normalize(q, dim=-1), F.normalize(p, dim=-1), None,
+                        temperature=args.temperature, stage=stage))
+
+        # Retrieval / VQA: gathered in-batch + gathered mined HNs
+        if con_idx:
+            ci = torch.tensor(con_idx, device=device)
+            q_ret = q_emb[ci]
+            p_ret = p_emb[ci]
+
+            hn_ret = None
+            if mined_hn_gathered is not None and mined_hn_gathered.shape[0] > 0:
+                B_gathered = q_emb.shape[0]
+                K = mined_hn_gathered.shape[0] // B_gathered if B_gathered > 0 else 0
+                if K > 0 and mined_hn_gathered.shape[0] == B_gathered * K:
+                    hn_reshaped = mined_hn_gathered.view(B_gathered, K, -1)
+                    hn_ret = hn_reshaped[ci].reshape(-1, hn_reshaped.shape[-1])
+
             if mrl:
-                losses.append(mrl_infonce_loss(q_local, p_local, mined_hn_local,
-                              mrl_dims=mrl, temperature=args.temperature,
-                              stage=args.training_stage))
+                losses.append(mrl_infonce_loss(
+                    q_ret, p_ret, hn_ret,
+                    mrl_dims=mrl, temperature=args.temperature, stage=stage))
             else:
                 losses.append(masked_infonce_loss(
-                    F.normalize(q_local, dim=-1),
-                    F.normalize(p_local, dim=-1),
-                    F.normalize(mined_hn_local, dim=-1),
-                    temperature=args.temperature, stage=args.training_stage))
-            used_mined = True
+                    F.normalize(q_ret, dim=-1),
+                    F.normalize(p_ret, dim=-1),
+                    F.normalize(hn_ret, dim=-1) if hn_ret is not None else None,
+                    temperature=args.temperature, stage=stage))
 
-    # --- Retrieval / VQA without mined HNs: gathered InfoNCE -----------------
-    if con_idx and not used_mined:
-        ci = torch.tensor(con_idx, device=device)
-        q, p = q_emb[ci], p_emb[ci]
-        if mrl:
-            losses.append(mrl_infonce_loss(q, p, None, mrl_dims=mrl,
-                          temperature=args.temperature, stage=args.training_stage))
-        else:
-            losses.append(masked_infonce_loss(
-                F.normalize(q, dim=-1), F.normalize(p, dim=-1), None,
-                temperature=args.temperature, stage=args.training_stage))
-
-    # --- STS: CoSENT loss ----------------------------------------------------
+    # STS: CoSENT loss (both stages)
     if sts_idx and scores is not None:
         si = torch.tensor(sts_idx, device=device)
         q, p, s = q_emb[si], p_emb[si], scores[si]
@@ -420,6 +428,11 @@ def _train_step(embedder, model, device, batch, args):
 
     q = GatherWithGrad.apply(q_local) if _world() > 1 else q_local
     p = GatherWithGrad.apply(p_local) if _world() > 1 else p_local
+    mined_hn_gathered = None
+    if mined_hn_local is not None and _world() > 1:
+        mined_hn_gathered = GatherWithGrad.apply(mined_hn_local)
+    elif mined_hn_local is not None:
+        mined_hn_gathered = mined_hn_local
 
     oom_flag = torch.tensor([1.0 if oom else 0.0], device=device)
     if _world() > 1:
@@ -433,7 +446,7 @@ def _train_step(embedder, model, device, batch, args):
     loss = _compute_loss(q, p, g_tt, g_scores, args,
                          q_local=q_local, p_local=p_local,
                          local_task_types=batch["task_types"], hn_emb=hn_local,
-                         mined_hn_local=mined_hn_local)
+                         mined_hn_gathered=mined_hn_gathered)
     loss_val = loss.detach().float().item()
 
     with no_sync():
@@ -573,6 +586,12 @@ def _build_dataloader(args, embedder, batch_size):
             mmeb_split=args.dataset_split,
             max_samples_per_subset=args.max_samples_per_subset,
             cache_dir=args.cache_dir)
+        # Stage 2 uses task-stratified sampling: each batch contains items
+        # of a single task type, so mined hard negatives are always properly
+        # aligned and gradient signal isn't diluted across task types.
+        sampler = TaskStratifiedSampler(
+            dataset, batch_size=batch_size,
+            num_replicas=_world(), rank=_rank(), seed=args.seed)
     else:
         dataset = build_mixed_dataset(
             data_dir=args.data_dir, image_dir=args.image_dir,
@@ -580,12 +599,12 @@ def _build_dataloader(args, embedder, batch_size):
             mmeb_split=args.dataset_split,
             max_samples_per_subset=args.max_samples_per_subset,
             cache_dir=args.cache_dir)
+        from torch.utils.data import DistributedSampler
+        sampler = DistributedSampler(dataset, num_replicas=_world(),
+                                     rank=_rank(), shuffle=True, seed=args.seed) if _world() > 1 else None
 
-    from torch.utils.data import DistributedSampler
-    sampler = DistributedSampler(dataset, num_replicas=_world(),
-                                 rank=_rank(), shuffle=True, seed=args.seed) if _world() > 1 else None
-    return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
-                      shuffle=(sampler is None),
+    return DataLoader(dataset, batch_size=batch_size,
+                      sampler=sampler, shuffle=(sampler is None),
                       collate_fn=collate_embedding_batch,
                       num_workers=args.num_workers, drop_last=True,
                       pin_memory=True, persistent_workers=args.num_workers > 0,
@@ -668,6 +687,8 @@ def train(args):
     embedder.model, optimizer = accelerator.prepare(embedder.model, optimizer)
 
     total_steps = len(dataloader) * args.epochs
+    if args.max_steps and args.max_steps > 0:
+        total_steps = min(total_steps, args.max_steps)
     warmup = int(total_steps * args.warmup_ratio)
     scheduler = accelerator.prepare(get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup, num_training_steps=total_steps))
@@ -735,7 +756,14 @@ def train(args):
                            optimizer=optimizer, scheduler=scheduler,
                            epoch=epoch, epoch_loss=epoch_loss, epoch_steps=epoch_steps)
 
+            if args.max_steps and global_step >= args.max_steps:
+                accelerator.print(f"Reached max_steps={args.max_steps}, stopping.")
+                break
+
         accelerator.print(f"Epoch {epoch} done. Loss: {epoch_loss / max(epoch_steps, 1):.4f}")
+
+        if args.max_steps and global_step >= args.max_steps:
+            break
 
     _save_ckpt(accelerator, embedder, args, global_step,
                optimizer=optimizer, scheduler=scheduler,
@@ -773,6 +801,8 @@ def main():
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--max_steps", type=int, default=None,
+                   help="Stop after this many steps (default: full epoch)")
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--warmup_ratio", type=float, default=0.1)

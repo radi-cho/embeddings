@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from PIL import Image
-from torch.utils.data import ConcatDataset, DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +280,98 @@ class VideoTripletDataset(Dataset):
                 "positive": {"text": r.get("positive_text")},
                 "task_type": r.get("task_type", "retrieval"),
                 "subset_name": self.subset_name}
+
+
+# ---------------------------------------------------------------------------
+# Task-stratified sampler
+# ---------------------------------------------------------------------------
+
+class TaskStratifiedSampler(Sampler):
+    """Yields batches where all items share the same task_type.
+
+    The dataset must be a ConcatDataset of sub-datasets that each expose a
+    `.task_type` attribute (MMEBDataset, MinedNegativesDataset, etc.) or a
+    constant via the item dict.  We precompute a task_type index at init by
+    scanning each sub-dataset.
+
+    Each epoch: shuffle within each task group, round-robin across groups
+    proportional to their size, drop remainder per group. Supports DDP via
+    num_replicas / rank.
+    """
+
+    def __init__(self, dataset: ConcatDataset, batch_size: int,
+                 num_replicas: int = 1, rank: int = 0,
+                 seed: int = 42, drop_last: bool = True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.drop_last = drop_last
+        self.epoch = 0
+
+        # Build index: global_idx -> task_type
+        self.task_indices: Dict[str, List[int]] = {}
+        offset = 0
+        for sub_ds in dataset.datasets:
+            tt = getattr(sub_ds, "task_type", None)
+            if tt is None:
+                # MinedNegativesDataset doesn't have a single task_type;
+                # peek at the first item's task_type.
+                try:
+                    tt = sub_ds[0].get("task_type", "retrieval")
+                except Exception:
+                    tt = "retrieval"
+            n = len(sub_ds)
+            self.task_indices.setdefault(tt, []).extend(range(offset, offset + n))
+            offset += n
+
+        logger.info("TaskStratifiedSampler: %s",
+                     {k: len(v) for k, v in self.task_indices.items()})
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def __iter__(self):
+        import random as _rng
+        g = _rng.Random(self.seed + self.epoch)
+
+        # Shuffle each task group
+        groups = {}
+        for tt, indices in self.task_indices.items():
+            shuffled = list(indices)
+            g.shuffle(shuffled)
+            groups[tt] = shuffled
+
+        # Shard per rank
+        for tt in groups:
+            idx = groups[tt]
+            per_rank = len(idx) // self.num_replicas
+            start = self.rank * per_rank
+            groups[tt] = idx[start : start + per_rank]
+
+        # Build batches within each group
+        all_batches = []
+        bs = self.batch_size
+        for tt, idx in groups.items():
+            for i in range(0, len(idx) - (bs - 1), bs):
+                all_batches.append(idx[i : i + bs])
+            if not self.drop_last and len(idx) % bs != 0:
+                all_batches.append(idx[-(len(idx) % bs):])
+
+        # Shuffle batches across groups so task order is random
+        g.shuffle(all_batches)
+
+        for batch in all_batches:
+            yield from batch
+
+    def __len__(self):
+        total = 0
+        bs = self.batch_size
+        for idx in self.task_indices.values():
+            per_rank = len(idx) // self.num_replicas
+            total += per_rank // bs
+        return total * bs
 
 
 # ---------------------------------------------------------------------------
