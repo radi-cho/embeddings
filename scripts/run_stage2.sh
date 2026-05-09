@@ -2,7 +2,7 @@
 # Stage 2 training with K=15 mined hard negatives (Qwen3-VL paper methodology).
 #
 # Prerequisites:
-#   - Stage 1 LoRA checkpoint at ${ROOT}/data/outputs/stage1-lr1e4-a64/checkpoint-15000
+#   - Stage 1 LoRA checkpoint at ${ROOT}/data/outputs/stage1-lr1e4-a64/final
 #   - Mined JSONL files in ${ROOT}/data/training_data_mined/ (produced by scripts/mine_hard_negatives.py)
 #
 # Data routing (per task_type):
@@ -26,7 +26,7 @@ fi
 
 # ---- Paths ----
 : "${CUDA_DEVICES:=0,1,2,3,4,5,6,7}"
-: "${MODEL_PATH:=${ROOT}/data/outputs/stage1-lr1e4-a64/checkpoint-15000}"
+: "${MODEL_PATH:=${ROOT}/data/outputs/stage1-lr1e4-a64/final}"
 : "${OUTPUT_DIR:=${ROOT}/data/outputs/stage2-k15}"
 : "${IMAGE_DIR:=${ROOT}/datasets/mmeb_train_images/images}"
 : "${DATA_DIR:=${ROOT}/data/training_data}"

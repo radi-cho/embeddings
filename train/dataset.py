@@ -50,6 +50,147 @@ IMAGE_PLACEHOLDER = "<|image_1|>"
 DEFAULT_INSTRUCTION = "Represent the user's input."
 FRAME_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
+# Query-side instructions (positives / hard negatives keep DEFAULT_INSTRUCTION in collate).
+CLASSIFICATION_INSTRUCTIONS = (
+    "Represent the given image for classification.",
+    "Classify this image into one of the categories.",
+)
+INSTRUCTION_VQA = "Represent the given image with the following question."
+INSTRUCTION_T2I = "Find an image that matches the given caption."
+INSTRUCTION_I2T = "Represent the given image for retrieval."
+INSTRUCTION_MSCOCO_GROUND = "Locate the described region in the image."
+INSTRUCTION_IMAGE_PAIR = "Find a similar image."
+INSTRUCTION_TEXT_RETRIEVAL = "Given a query, retrieve a relevant passage."
+INSTRUCTION_SEMANTIC_TEXT = "Retrieve semantically similar text."
+INSTRUCTION_COLPALI = "Retrieve a document page relevant to the query."
+INSTRUCTION_VIDEO = "Represent the video with the following text for retrieval."
+
+# Stage-1 optimized mix: MMEB subsets and per-source caps (~5.128M total).
+STAGE1_RETRIEVAL_SUBSETS = [
+    "MSCOCO", "MSCOCO_i2t", "MSCOCO_t2i",
+    "VisualNews_i2t", "VisualNews_t2i",
+    "CIRR", "NIGHTS", "VisDial", "WebQA",
+]
+STAGE1_VQA_SUBSETS = [
+    "OK-VQA", "DocVQA", "ChartQA", "Visual7W",
+    "InfographicsVQA", "A-OKVQA",
+]
+STAGE1_CLASSIFICATION_SUBSETS = list(TASK_TYPE_MAP["classification"])
+
+STAGE1_CAP_MEGAPAIRS = 1_500_000
+STAGE1_CAP_MMEB_RETRIEVAL_TOTAL = 550_000
+STAGE1_CAP_MSMARCO = 500_000
+STAGE1_CAP_GOOAQ = 500_000
+STAGE1_CAP_MMEB_CLASS_TOTAL = 300_000
+STAGE1_CAP_MMEB_VQA_TOTAL = 250_000
+STAGE1_CAP_COLPALI = 118_000
+STAGE1_CAP_ALLNLI = 300_000
+STAGE1_CAP_QUORA = 100_000
+STAGE1_CAP_LAVA_HOUND = 255_000
+STAGE1_CAP_MINED_RETRIEVAL_TOTAL = 650_000
+STAGE1_CAP_MINED_CLASSIFICATION = 100_000
+
+
+def _split_budget(total: int, n: int) -> List[int]:
+    if n <= 0:
+        return []
+    base, rem = divmod(total, n)
+    return [base + (1 if i < rem else 0) for i in range(n)]
+
+
+def mmeb_query_instruction(
+    subset_name: str,
+    row_index: int,
+    qry_raw: str,
+    qry_image_path: Optional[str],
+    pos_text: str,
+    pos_image_path: Optional[str],
+) -> str:
+    """Instruction for the query side of an MMEB row (paper-aligned templates)."""
+    tt = _infer_task_type(subset_name)
+    q_text = _clean_mmeb_text(qry_raw) if qry_raw else ""
+    p_text = _clean_mmeb_text(pos_text) if pos_text else ""
+    q_has_path = bool(qry_image_path and str(qry_image_path).strip())
+    p_has_path = bool(pos_image_path and str(pos_image_path).strip())
+
+    if tt == "classification":
+        return CLASSIFICATION_INSTRUCTIONS[row_index % len(CLASSIFICATION_INSTRUCTIONS)]
+    if tt == "vqa":
+        return INSTRUCTION_VQA
+
+    if subset_name in ("MSCOCO_t2i", "VisualNews_t2i"):
+        return INSTRUCTION_T2I
+    if subset_name in ("MSCOCO_i2t", "VisualNews_i2t"):
+        return INSTRUCTION_I2T
+    if subset_name == "MSCOCO":
+        return INSTRUCTION_MSCOCO_GROUND
+
+    # Generic retrieval: infer from modalities.
+    if q_has_path and p_has_path:
+        return INSTRUCTION_IMAGE_PAIR
+    if q_has_path and p_text and not p_has_path:
+        return INSTRUCTION_I2T
+    if p_has_path and q_text and not q_has_path:
+        return INSTRUCTION_T2I
+    if q_has_path:
+        return INSTRUCTION_I2T
+    return INSTRUCTION_T2I
+
+
+def text_triplet_query_instruction(subset_name: str) -> str:
+    s = (subset_name or "").lower()
+    if s in ("msmarco", "gooaq"):
+        return INSTRUCTION_TEXT_RETRIEVAL
+    if s in ("allnli", "quora"):
+        return INSTRUCTION_SEMANTIC_TEXT
+    return INSTRUCTION_TEXT_RETRIEVAL
+
+
+def mined_row_query_instruction(task_type: str, subset_name: str, row_index: int) -> str:
+    """Template for mined JSONL rows (subset names may be 'mmeb_OK-VQA', etc.)."""
+    tt = task_type or "retrieval"
+    # Normalize mmeb_* stem
+    name = subset_name or ""
+    if name.startswith("mmeb_"):
+        name = name[len("mmeb_") :]
+    if name in ALL_MMEB_SUBSETS:
+        # Use classification rotation for cls; else reuse MMEB rules with text-only hints.
+        if tt == "classification":
+            return CLASSIFICATION_INSTRUCTIONS[row_index % len(CLASSIFICATION_INSTRUCTIONS)]
+        if tt == "vqa" or name in TASK_TYPE_MAP.get("vqa", []):
+            return INSTRUCTION_VQA
+        return mmeb_query_instruction(
+            name, row_index, "", None, "", None,
+        )
+    if tt == "classification":
+        return CLASSIFICATION_INSTRUCTIONS[row_index % len(CLASSIFICATION_INSTRUCTIONS)]
+    if name.lower() == "colpali":
+        return INSTRUCTION_COLPALI
+    if name.lower() in ("msmarco", "gooaq"):
+        return INSTRUCTION_TEXT_RETRIEVAL
+    if name.lower() in ("quora", "allnli"):
+        return INSTRUCTION_SEMANTIC_TEXT
+    return INSTRUCTION_TEXT_RETRIEVAL
+
+
+def fallback_query_instruction(item: Dict[str, Any], row_index: int) -> str:
+    """If a dataset did not set query['instruction'], infer from metadata."""
+    tt = item.get("task_type", "retrieval")
+    sn = item.get("subset_name", "")
+    if tt == "sts":
+        return INSTRUCTION_SEMANTIC_TEXT
+    if sn == "MegaPairs":
+        return INSTRUCTION_IMAGE_PAIR
+    if sn == "ColPali":
+        return INSTRUCTION_COLPALI
+    if sn in ("llava_hound", "msrvtt", "video_retrieval"):
+        return INSTRUCTION_VIDEO
+    if sn in ("msmarco", "gooaq", "allnli", "quora"):
+        return text_triplet_query_instruction(sn)
+    if sn in ALL_MMEB_SUBSETS:
+        return mmeb_query_instruction(sn, row_index, "", None, "", None)
+    return DEFAULT_INSTRUCTION
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -120,11 +261,18 @@ class MMEBDataset(Dataset):
 
     def __getitem__(self, idx):
         r = self.data[idx]
+        q_img_path = r.get("qry_image_path", "")
+        p_img_path = r.get("pos_image_path", "")
+        q_inst = mmeb_query_instruction(
+            self.subset_name, idx, r.get("qry", ""), q_img_path,
+            r.get("pos_text", ""), p_img_path,
+        )
         out = {
             "query": {"text": _clean_mmeb_text(r["qry"]) or None,
-                      "image": _load_image(r.get("qry_image_path", ""), self.image_dir)},
+                      "image": _load_image(q_img_path, self.image_dir),
+                      "instruction": q_inst},
             "positive": {"text": _clean_mmeb_text(r.get("pos_text", "")) or None,
-                         "image": _load_image(r.get("pos_image_path", ""), self.image_dir)},
+                         "image": _load_image(p_img_path, self.image_dir)},
             "task_type": self.task_type, "subset_name": self.subset_name,
         }
         if self.task_type == "classification":
@@ -148,7 +296,8 @@ class STSDataset(Dataset):
 
     def __getitem__(self, idx):
         a, b, score = self.data[idx]
-        return {"query": {"text": a}, "positive": {"text": b},
+        return {"query": {"text": a, "instruction": INSTRUCTION_SEMANTIC_TEXT},
+                "positive": {"text": b},
                 "score": score, "task_type": "sts", "subset_name": self.subset_name}
 
 
@@ -163,7 +312,9 @@ class TextTripletDataset(Dataset):
 
     def __getitem__(self, idx):
         r = self.data[idx]
-        out = {"query": {"text": r["query"]}, "positive": {"text": r["positive"]},
+        out = {"query": {"text": r["query"],
+                         "instruction": text_triplet_query_instruction(self.subset_name)},
+               "positive": {"text": r["positive"]},
                "task_type": r.get("task_type", "retrieval"),
                "subset_name": self.subset_name}
         neg = r.get("negative") or r.get("hard_negative")
@@ -209,8 +360,14 @@ class MinedNegativesDataset(Dataset):
         r = self.data[idx]
         hns_raw = r.get("hard_negatives") or []
         hns = [self._side(h) for h in hns_raw[: self.max_hn]]
+        q = self._side(r["query"])
+        q["instruction"] = mined_row_query_instruction(
+            r.get("task_type", "retrieval"),
+            r.get("subset_name", self.subset_name),
+            idx,
+        )
         return {
-            "query": self._side(r["query"]),
+            "query": q,
             "positive": self._side(r["positive"]),
             "hard_negatives": hns,
             "task_type": r.get("task_type", "retrieval"),
@@ -232,7 +389,8 @@ class MegaPairsDataset(Dataset):
         texts = r.get("q_texts") or r.get("q_text") or []
         q_img = _load_image(r.get("q_img", ""), self.image_dir)
         t_img = _load_image(r.get("t_img", ""), self.image_dir)
-        return {"query": {"text": texts[0] if texts else None, "image": q_img},
+        return {"query": {"text": texts[0] if texts else None, "image": q_img,
+                         "instruction": INSTRUCTION_IMAGE_PAIR},
                 "positive": {"image": t_img or q_img},
                 "task_type": "retrieval", "subset_name": "MegaPairs"}
 
@@ -256,7 +414,8 @@ class ColPaliDataset(Dataset):
                 img = Image.open(io.BytesIO(img)).convert("RGB")
             except Exception:
                 img = None
-        return {"query": {"text": r.get("query", "")},
+        return {"query": {"text": r.get("query", ""),
+                         "instruction": INSTRUCTION_COLPALI},
                 "positive": {"image": img},
                 "task_type": "retrieval", "subset_name": "ColPali"}
 
@@ -276,7 +435,8 @@ class VideoTripletDataset(Dataset):
         vp = r.get("video_path", "")
         if self.video_root and vp:
             vp = os.path.join(self.video_root, vp)
-        return {"query": {"text": r.get("query_text"), "video": _resolve_video(vp)},
+        return {"query": {"text": r.get("query_text"), "video": _resolve_video(vp),
+                         "instruction": INSTRUCTION_VIDEO},
                 "positive": {"text": r.get("positive_text")},
                 "task_type": r.get("task_type", "retrieval"),
                 "subset_name": self.subset_name}
@@ -384,11 +544,14 @@ def collate_embedding_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     negative_texts: List[Optional[List[str]]] = []
     hard_negatives_per_item: List[List[Dict[str, Any]]] = []
 
-    for item in batch:
-        for lst, key in [(queries, "query"), (positives, "positive")]:
-            d = item[key]
-            lst.append({"text": d.get("text"), "image": d.get("image"),
-                        "video": d.get("video"), "instruction": DEFAULT_INSTRUCTION})
+    for i, item in enumerate(batch):
+        d = item["query"]
+        q_inst = d.get("instruction") or fallback_query_instruction(item, i)
+        queries.append({"text": d.get("text"), "image": d.get("image"),
+                        "video": d.get("video"), "instruction": q_inst})
+        d = item["positive"]
+        positives.append({"text": d.get("text"), "image": d.get("image"),
+                          "video": d.get("video"), "instruction": DEFAULT_INSTRUCTION})
         task_types.append(item["task_type"])
         if has_scores:
             scores.append(item.get("score", 0.0))
@@ -518,6 +681,107 @@ def build_mixed_dataset(data_dir, image_dir=None, megapairs_image_dir=None,
 
     combined = ConcatDataset(parts)
     logger.info("Mixed total: %d examples from %d sources", len(combined), len(parts))
+    return combined
+
+
+def build_stage1_optimized_dataset(
+    data_dir,
+    image_dir=None,
+    megapairs_image_dir=None,
+    mined_dir=None,
+    mmeb_split="diverse_instruction",
+    cache_dir=None,
+):
+    """Balanced ~5.128M-sample Stage-1 mix (instruction-aware; mined HNs optional).
+
+    If ``mined_dir`` is missing or empty, mined chunks are skipped (logged).
+    """
+    base = Path(data_dir)
+    mined_root = Path(mined_dir) if mined_dir else None
+    parts: List[Dataset] = []
+
+    # --- MegaPairs ---------------------------------------------------------
+    p = base / "megapairs" / "train.jsonl"
+    if p.is_file():
+        try:
+            parts.append(MegaPairsDataset(
+                str(p), megapairs_image_dir or image_dir, STAGE1_CAP_MEGAPAIRS))
+        except Exception as e:
+            logger.error("MegaPairs (optimized): %s", e)
+
+    # --- MMEB retrieval (subset budget) ------------------------------------
+    r_caps = _split_budget(STAGE1_CAP_MMEB_RETRIEVAL_TOTAL, len(STAGE1_RETRIEVAL_SUBSETS))
+    for name, cap in zip(STAGE1_RETRIEVAL_SUBSETS, r_caps):
+        try:
+            parts.append(MMEBDataset(
+                name, split=mmeb_split, image_dir=image_dir,
+                max_samples=cap, cache_dir=cache_dir))
+        except Exception as e:
+            logger.error("MMEB retrieval '%s': %s", name, e)
+
+    # --- MMEB VQA ----------------------------------------------------------
+    v_caps = _split_budget(STAGE1_CAP_MMEB_VQA_TOTAL, len(STAGE1_VQA_SUBSETS))
+    for name, cap in zip(STAGE1_VQA_SUBSETS, v_caps):
+        try:
+            parts.append(MMEBDataset(
+                name, split=mmeb_split, image_dir=image_dir,
+                max_samples=cap, cache_dir=cache_dir))
+        except Exception as e:
+            logger.error("MMEB VQA '%s': %s", name, e)
+
+    # --- MMEB classification -----------------------------------------------
+    c_caps = _split_budget(STAGE1_CAP_MMEB_CLASS_TOTAL, len(STAGE1_CLASSIFICATION_SUBSETS))
+    for name, cap in zip(STAGE1_CLASSIFICATION_SUBSETS, c_caps):
+        try:
+            parts.append(MMEBDataset(
+                name, split=mmeb_split, image_dir=image_dir,
+                max_samples=cap, cache_dir=cache_dir))
+        except Exception as e:
+            logger.error("MMEB cls '%s': %s", name, e)
+
+    # --- Text triplets -----------------------------------------------------
+    p = base / "msmarco" / "train.jsonl"
+    if p.is_file():
+        parts.append(TextTripletDataset(str(p), "msmarco", STAGE1_CAP_MSMARCO))
+    p = base / "gooaq" / "train.jsonl"
+    if p.is_file():
+        parts.append(TextTripletDataset(str(p), "gooaq", STAGE1_CAP_GOOAQ))
+    p = base / "allnli" / "train.jsonl"
+    if p.is_file():
+        parts.append(TextTripletDataset(str(p), "allnli", STAGE1_CAP_ALLNLI))
+    p = base / "quora" / "train.jsonl"
+    if p.is_file():
+        parts.append(TextTripletDataset(str(p), "quora", STAGE1_CAP_QUORA))
+
+    # --- STS-B (full file; typically ~5.7k) ---------------------------------
+    p = base / "stsb" / "train.jsonl"
+    if p.is_file():
+        parts.append(STSDataset(str(p)))
+
+    # --- ColPali -----------------------------------------------------------
+    p = base / "colpali" / "data"
+    if p.is_dir():
+        try:
+            parts.append(ColPaliDataset(str(p), STAGE1_CAP_COLPALI))
+        except Exception as e:
+            logger.error("ColPali (optimized): %s", e)
+
+    # --- Video (LLaVA-Hound) ----------------------------------------------
+    p = base / "llava_hound" / "train.jsonl"
+    if p.is_file():
+        parts.append(VideoTripletDataset(
+            str(p), video_root=str(base), subset_name="llava_hound",
+            max_samples=STAGE1_CAP_LAVA_HOUND))
+
+    # NOTE: Mined hard negatives are NOT included in Stage 1 (paper §4.1).
+    # Stage 1 relies on in-batch negatives only. Mined HNs are for Stage 2.
+
+    if not parts:
+        raise RuntimeError(f"No data for optimized Stage-1 mix under {data_dir}")
+
+    combined = ConcatDataset(parts)
+    logger.info("Stage1 optimized total: %d examples from %d sources",
+                len(combined), len(parts))
     return combined
 
 

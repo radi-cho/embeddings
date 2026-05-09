@@ -16,6 +16,10 @@ For each dataset:
   7. Write JSONL line-by-line to data/training_data_mined/<name>.jsonl.
   8. Emit ONE "[mine] ..." summary line.
 
+`--mine-classification-labels`: embed all MMEB class names, then for each classification
+(image, label) pair FAISS-search the top-15 most similar *wrong* labels (writes
+`classification_hn.jsonl`).  Queries use images when paths resolve under `--image-dir`.
+
 When all requested datasets are done: touch /tmp/mining_complete.sentinel.
 """
 
@@ -47,7 +51,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-DEFAULT_MODEL = str(_PROJECT_ROOT / "data/outputs/stage1-lr1e4-a64/merged-15000")
+
+def _pick_default_model() -> str:
+    for candidate in (
+        _PROJECT_ROOT / "data/outputs/stage1-lr1e4-a64/merged-final",
+        _PROJECT_ROOT / "data/outputs/stage1-lr1e4-a64/merged-15000",
+        _PROJECT_ROOT / "data/outputs/stage1-lr1e4-a64/final",
+    ):
+        if (candidate / "config.json").is_file():
+            return str(candidate)
+    return str(_PROJECT_ROOT / "models/checkpoints/Qwen3.5-0.8B")
+
+
+DEFAULT_MODEL = _pick_default_model()
 BASE_MODEL = str(_PROJECT_ROOT / "models/checkpoints/Qwen3.5-0.8B")
 STAGE1_CKPT = str(_PROJECT_ROOT / "data/outputs/stage1-lr1e4-a64/checkpoint-15000")
 OUT_DIR = _PROJECT_ROOT / "data/training_data_mined"
@@ -265,6 +281,155 @@ def faiss_topk(corpus_emb: np.ndarray, query_emb: np.ndarray,
     return np.concatenate(all_s), np.concatenate(all_i)
 
 
+def cls_row_to_embed_item(r: Dict[str, Any], instruction: str, image_dir: Path) -> Dict[str, Any]:
+    from train.dataset import _clean_mmeb_text
+
+    text = _clean_mmeb_text(r.get("qry", "") or "")
+    item: Dict[str, Any] = {"instruction": instruction}
+    p = r.get("qry_image_path") or ""
+    if p:
+        img = _load_pil(str(p), image_dir)
+        if img is not None:
+            item["image"] = img
+    if text:
+        item["text"] = text
+    if "text" not in item and "image" not in item:
+        item["text"] = "NULL"
+    return item
+
+
+def mine_classification_labels(
+    embedder, image_dir: Path, dim: int, batch_size: int,
+) -> None:
+    """Top-K similar *wrong* class labels per (image, query) classification pair."""
+    from datasets import load_dataset
+
+    from train.dataset import (
+        CLASSIFICATION_INSTRUCTIONS,
+        STAGE1_CLASSIFICATION_SUBSETS,
+        _clean_mmeb_text,
+    )
+
+    import faiss
+
+    out_path = OUT_DIR / "classification_hn.jsonl"
+    if out_path.is_file() and out_path.stat().st_size > 0:
+        with open(out_path) as f:
+            n_existing = sum(1 for _ in f)
+        _stamp(f"[mine] classification_hn: SKIP (exists) rows={n_existing} file={out_path}")
+        return
+
+    # Pass 1: unique labels only (avoid storing all rows in RAM).
+    label_set: set = set()
+    for name in STAGE1_CLASSIFICATION_SUBSETS:
+        _stamp(f"[mine] classification labels: scan labels in {name}")
+        try:
+            ds = load_dataset(
+                "TIGER-Lab/MMEB-train", name,
+                split="diverse_instruction", streaming=False,
+            )
+        except Exception as e:
+            logger.error("classification subset %s: %s", name, e)
+            _stamp(f"[mine] classification {name}: FAILED load {e}")
+            continue
+        for r in ds:
+            pt = _clean_mmeb_text(r.get("pos_text", "") or "")
+            if pt:
+                label_set.add(pt)
+
+    if not label_set:
+        logger.error("No classification labels; abort classification mining")
+        _stamp("[mine] classification_hn: FAILED (no labels)")
+        return
+
+    labels_sorted = sorted(label_set)
+    label_items = [{"text": t, "instruction": DEFAULT_INSTRUCTION} for t in labels_sorted]
+    logger.info("Embedding %d unique class labels", len(label_items))
+    lab_emb = embed_items(
+        embedder, label_items, image_dir, dim,
+        batch_size=min(batch_size, 64), tag="class.labels",
+    )
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    faiss_index = faiss.IndexFlatIP(dim)
+    faiss_index.add(np.ascontiguousarray(lab_emb))
+
+    cls_topk = 50
+    row_i = 0
+    total_hn = 0
+    n_out = 0
+    t0 = time.time()
+
+    with open(out_path, "w") as fout:
+        q_batch: List[Dict[str, Any]] = []
+        meta_batch: List[Tuple[str, str, Dict[str, Any]]] = []
+
+        def flush() -> None:
+            nonlocal q_batch, meta_batch, total_hn, n_out
+            if not q_batch:
+                return
+            q_emb = embed_items(
+                embedder, q_batch, image_dir, dim,
+                batch_size=batch_size, tag="class.q",
+            )
+            _, ix = faiss_index.search(np.ascontiguousarray(q_emb), cls_topk)
+            for bi, (correct, name, r) in enumerate(meta_batch):
+                hn_dicts: List[Dict[str, Any]] = []
+                seen_txts: set = set()
+                for k in range(cls_topk):
+                    j = int(ix[bi, k])
+                    if j < 0:
+                        continue
+                    cand = labels_sorted[j]
+                    if cand == correct or cand in seen_txts:
+                        continue
+                    seen_txts.add(cand)
+                    hn_dicts.append({"text": cand, "image_path": None})
+                    if len(hn_dicts) >= NUM_HN:
+                        break
+                total_hn += len(hn_dicts)
+                n_out += 1
+                q_txt = _clean_mmeb_text(r.get("qry", "") or "")
+                rec = {
+                    "query": {"text": q_txt or None, "image_path": r.get("qry_image_path")},
+                    "positive": {"text": correct, "image_path": r.get("pos_image_path")},
+                    "hard_negatives": hn_dicts,
+                    "task_type": "classification",
+                    "subset_name": name,
+                }
+                fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            q_batch.clear()
+            meta_batch.clear()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        for name in STAGE1_CLASSIFICATION_SUBSETS:
+            try:
+                ds = load_dataset(
+                    "TIGER-Lab/MMEB-train", name,
+                    split="diverse_instruction", streaming=False,
+                )
+            except Exception as e:
+                logger.error("classification subset %s (pass 2): %s", name, e)
+                continue
+            for r in ds:
+                instr = CLASSIFICATION_INSTRUCTIONS[row_i % len(CLASSIFICATION_INSTRUCTIONS)]
+                row_i += 1
+                q_batch.append(cls_row_to_embed_item(r, instr, image_dir))
+                correct = _clean_mmeb_text(r.get("pos_text", "") or "")
+                meta_batch.append((correct, name, r))
+                if len(q_batch) >= batch_size:
+                    flush()
+        flush()
+
+    avg_hn = total_hn / max(n_out, 1)
+    _stamp(
+        f"[mine] classification_hn: {n_out} rows, avg_hn={avg_hn:.2f}, "
+        f"time={(time.time() - t0) / 60:.1f}min, file={out_path}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Mine one dataset
 # ---------------------------------------------------------------------------
@@ -399,6 +564,11 @@ def mine_dataset(name: str, rows: List[Dict], embedder, image_dir: Path,
 def ensure_merged(merged_path: str) -> str:
     if Path(merged_path, "config.json").is_file():
         return merged_path
+    if not Path(STAGE1_CKPT, "adapter_config.json").is_file():
+        raise FileNotFoundError(
+            f"No merged model at {merged_path} and no LoRA at {STAGE1_CKPT}; "
+            "pass --model /path/to/merged or train Stage 1 first."
+        )
     logger.info("Merging %s into %s ...", STAGE1_CKPT, merged_path)
     from peft import PeftModel
     from transformers import AutoModel, AutoTokenizer
@@ -429,10 +599,14 @@ def main():
     parser.add_argument("--datasets",
                         default="quora,msmarco,gooaq,colpali,mmeb_retrieval,mmeb_vqa")
     parser.add_argument("--gooaq-max", type=int, default=500_000)
+    parser.add_argument(
+        "--mine-classification-labels",
+        action="store_true",
+        help="Only run MMEB classification label hard-negative mining (writes classification_hn.jsonl).",
+    )
     args = parser.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    wanted = set(args.datasets.split(","))
 
     # -- Load embedder ONCE on cuda:0 ------------------------------------
     model_path = ensure_merged(args.model)
@@ -447,6 +621,14 @@ def main():
     if embedder.model is not None:
         embedder.model.to("cuda:0")
         embedder.model.eval()
+
+    if args.mine_classification_labels:
+        _stamp("[mine] classification-label mining (MMEB class subsets)")
+        mine_classification_labels(embedder, IMAGE_DIR, args.dim, args.batch_size)
+        SENTINEL.write_text("classification-only\n")
+        return
+
+    wanted = set(args.datasets.split(","))
 
     summary: List[Tuple[str, int, float, float]] = []  # name, n, avg_hn, size_mb
 

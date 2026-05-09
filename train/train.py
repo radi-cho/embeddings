@@ -9,8 +9,10 @@ DDP training with cross-GPU embedding gathering for contrastive loss:
     per-task losses (InfoNCE stage 1/2, CoSENT, classification InfoNCE).
   - OOM on any rank → all ranks skip the step in sync (no DDP deadlock).
 
-Stage toggle: --mined_dir set  =>  build_stage2_dataset (paper §4.3).
-              --mined_dir unset =>  build_mixed_dataset (full Stage-1 corpus).
+Stage toggle:
+  --training_stage 2 + --mined_dir  =>  build_stage2_dataset (paper §4.3).
+  --use_optimized_mix               =>  build_stage1_optimized_dataset (~5.1M mix).
+  else (Stage 1, no optimized flag) =>  build_mixed_dataset (full corpus).
 """
 
 import argparse
@@ -38,7 +40,8 @@ from transformers import get_cosine_schedule_with_warmup
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from train.dataset import (
-    build_dataloader, build_mixed_dataset, build_stage2_dataset,
+    build_dataloader, build_mixed_dataset, build_stage1_optimized_dataset,
+    build_stage2_dataset,
     collate_embedding_batch, TaskStratifiedSampler,
 )
 from train.losses import (
@@ -62,11 +65,20 @@ def _patch_gdn_bf16():
 
     def _bf16_forward(self, hidden_states, cache_params=None, **kwargs):
         batch_size, seq_len, _ = hidden_states.shape
-        use_precomputed_states = cache_params is not None and cache_params.has_previous_state
-
-        if use_precomputed_states:
-            conv_state = cache_params.layers[self.layer_idx].conv_states
-            recurrent_state = cache_params.layers[self.layer_idx].recurrent_states
+        conv_state = None
+        recurrent_state = None
+        if cache_params is not None:
+            layer_cache = cache_params.layers[self.layer_idx]
+            conv_state = getattr(layer_cache, "conv_states", None)
+            recurrent_state = getattr(layer_cache, "recurrent_states", None)
+        # HF cache can report has_previous_state while conv/recurrent tensors are still
+        # unset — causal_conv1d_update requires non-None conv_state (see instruction_pipeline crash).
+        use_precomputed_states = (
+            cache_params is not None
+            and getattr(cache_params, "has_previous_state", False)
+            and conv_state is not None
+            and recurrent_state is not None
+        )
 
         mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
         z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
@@ -264,12 +276,21 @@ def _compute_loss(q_emb, p_emb, task_types, scores, args,
         if non_sts_idx:
             ci = torch.tensor(non_sts_idx, device=device)
             q, p = q_emb[ci], p_emb[ci]
+            hn_ret = None
+            if mined_hn_gathered is not None and mined_hn_gathered.shape[0] > 0:
+                Bg = q_emb.shape[0]
+                K = mined_hn_gathered.shape[0] // Bg if Bg > 0 else 0
+                if K > 0 and mined_hn_gathered.shape[0] == Bg * K:
+                    hn_reshaped = mined_hn_gathered.view(Bg, K, -1)
+                    hn_ret = hn_reshaped[ci].reshape(-1, hn_reshaped.shape[-1])
             if mrl:
-                losses.append(mrl_infonce_loss(q, p, None, mrl_dims=mrl,
-                              temperature=args.temperature, stage=1))
+                losses.append(mrl_infonce_loss(
+                    q, p, hn_ret, mrl_dims=mrl,
+                    temperature=args.temperature, stage=1))
             else:
                 losses.append(masked_infonce_loss(
-                    F.normalize(q, dim=-1), F.normalize(p, dim=-1), None,
+                    F.normalize(q, dim=-1), F.normalize(p, dim=-1),
+                    F.normalize(hn_ret, dim=-1) if hn_ret is not None else None,
                     temperature=args.temperature, stage=1))
 
     # =======================================================================
@@ -380,6 +401,11 @@ def _train_step(embedder, model, device, batch, args):
     (preventing deadlock if one rank OOMs mid-backward). Gradients are
     manually all-reduced after a successful backward on all ranks.
     Returns loss float, or None if any rank OOMed at any phase.
+
+    With gradient checkpointing enabled, OOMs during backward can manifest as
+    RuntimeError or even non-Python CUDA errors that bypass the normal
+    try/except. We catch *all* exceptions during backward, and also proactively
+    skip steps when free GPU memory is dangerously low before backward begins.
     """
     sq, sp = _get_streams(device)
     bs = len(batch["queries"])
@@ -399,24 +425,30 @@ def _train_step(embedder, model, device, batch, args):
             sq.synchronize()
             sp.synchronize()
 
-            neg_texts = batch.get("negative_texts")
-            if neg_texts is not None:
-                cls_mask = [t == "classification" for t in batch["task_types"]]
-                neg_items = []
-                for i, is_cls in enumerate(cls_mask):
-                    if is_cls and neg_texts[i]:
-                        for t in neg_texts[i]:
-                            neg_items.append({"text": t, "instruction": "Represent the label."})
-                if neg_items:
-                    hn_local = _encode_batch(model, embedder, neg_items, device)
+            # Classification wrong-class labels (Stage 2 only).
+            if args.training_stage >= 2:
+                neg_texts = batch.get("negative_texts")
+                if neg_texts is not None:
+                    cls_mask = [t == "classification" for t in batch["task_types"]]
+                    neg_items = []
+                    for i, is_cls in enumerate(cls_mask):
+                        if is_cls and neg_texts[i]:
+                            for t in neg_texts[i]:
+                                neg_items.append({"text": t, "instruction": "Represent the label."})
+                    if neg_items:
+                        hn_local = _encode_batch(model, embedder, neg_items, device)
 
-            # Mined hard-negatives: collate guarantees uniform K across the
-            # batch, so we flatten row-major: [row0.hn0..hnK, row1.hn0..hnK, ...]
+            # Mined / JSONL hard negatives (Stage 1 optimized mix + Stage 2 retrieval).
             mined_hns = batch.get("hard_negatives")
-            if mined_hns and all(len(h) > 0 for h in mined_hns):
+            if mined_hns and max(len(h) for h in mined_hns) > 0:
                 flat = [h for row in mined_hns for h in row]
                 if flat:
-                    mined_hn_local = _encode_batch(model, embedder, flat, device)
+                    _hn_bs = bs
+                    hn_parts = []
+                    for _i in range(0, len(flat), _hn_bs):
+                        hn_parts.append(
+                            _encode_batch(model, embedder, flat[_i:_i + _hn_bs], device))
+                    mined_hn_local = torch.cat(hn_parts, dim=0)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             oom = True
@@ -440,6 +472,31 @@ def _train_step(embedder, model, device, batch, args):
     if oom_flag.item() > 0:
         return None
 
+    # --- Pre-backward memory check: skip if recomputation will likely OOM ---
+    # Gradient checkpointing roughly doubles peak memory during backward vs.
+    # forward-only because activations are recomputed. If free memory after
+    # forward is below a safety threshold, skip proactively.
+    if torch.cuda.is_available():
+        free_mem, total_mem = torch.cuda.mem_get_info(device)
+        used_frac = 1.0 - (free_mem / total_mem)
+        if used_frac > 0.92:
+            torch.cuda.empty_cache()
+            free_mem, total_mem = torch.cuda.mem_get_info(device)
+            used_frac = 1.0 - (free_mem / total_mem)
+            if used_frac > 0.90:
+                logger.warning(
+                    "Proactive skip: %.1f%% GPU memory used after forward on rank %d "
+                    "(free=%.0fMB); skipping backward to avoid OOM during recomputation.",
+                    used_frac * 100, _rank(), free_mem / 1e6)
+                oom = True
+                oom_flag.fill_(1.0)
+                if _world() > 1:
+                    dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX)
+                for param in model.parameters():
+                    if param.grad is not None:
+                        param.grad.zero_()
+                return None
+
     # --- Phase 2: loss + backward (still no DDP sync — manual reduce after) -
     scores = batch["scores"].to(device) if batch["scores"] is not None else None
     g_tt, g_scores = _gather_metadata(batch["task_types"], scores, device)
@@ -456,6 +513,24 @@ def _train_step(embedder, model, device, batch, args):
             torch.cuda.empty_cache()
             oom = True
             logger.warning("OOM during backward on rank %d", _rank())
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad.zero_()
+        except RuntimeError as e:
+            # Gradient checkpointing recomputation can raise RuntimeError wrapping
+            # a CUDA OOM or other CUDA error instead of OutOfMemoryError directly.
+            torch.cuda.empty_cache()
+            oom = True
+            logger.warning("RuntimeError during backward on rank %d: %s", _rank(), str(e)[:200])
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad.zero_()
+        except Exception as e:
+            # Catch-all for any other unexpected exception during backward to
+            # prevent one rank from dying and causing NCCL timeout on others.
+            torch.cuda.empty_cache()
+            oom = True
+            logger.error("Unexpected error during backward on rank %d: %s", _rank(), str(e)[:200])
             for param in model.parameters():
                 if param.grad is not None:
                     param.grad.zero_()
@@ -577,21 +652,31 @@ def _build_dataloader(args, embedder, batch_size):
             cache_dir=args.cache_dir,
             batch_size=batch_size, num_workers=args.num_workers, shuffle=True)
 
-    # Stage 2 (mined HNs) vs Stage 1 (full mixed corpus) is decided by
-    # whether --mined_dir is set.
-    if args.mined_dir:
+    from torch.utils.data import DistributedSampler
+
+    # Stage 2: curated mined mix + stratified batches.
+    if args.training_stage == 2 and args.mined_dir:
         dataset = build_stage2_dataset(
             data_dir=args.data_dir, mined_dir=args.mined_dir,
             image_dir=args.image_dir,
             mmeb_split=args.dataset_split,
             max_samples_per_subset=args.max_samples_per_subset,
             cache_dir=args.cache_dir)
-        # Stage 2 uses task-stratified sampling: each batch contains items
-        # of a single task type, so mined hard negatives are always properly
-        # aligned and gradient signal isn't diluted across task types.
         sampler = TaskStratifiedSampler(
             dataset, batch_size=batch_size,
             num_replicas=_world(), rank=_rank(), seed=args.seed)
+    elif args.use_optimized_mix:
+        dataset = build_stage1_optimized_dataset(
+            data_dir=args.data_dir,
+            image_dir=args.image_dir,
+            megapairs_image_dir=args.megapairs_image_dir,
+            mined_dir=args.mined_dir,
+            mmeb_split=args.dataset_split,
+            cache_dir=args.cache_dir,
+        )
+        sampler = DistributedSampler(
+            dataset, num_replicas=_world(), rank=_rank(),
+            shuffle=True, seed=args.seed) if _world() > 1 else None
     else:
         dataset = build_mixed_dataset(
             data_dir=args.data_dir, image_dir=args.image_dir,
@@ -599,7 +684,6 @@ def _build_dataloader(args, embedder, batch_size):
             mmeb_split=args.dataset_split,
             max_samples_per_subset=args.max_samples_per_subset,
             cache_dir=args.cache_dir)
-        from torch.utils.data import DistributedSampler
         sampler = DistributedSampler(dataset, num_replicas=_world(),
                                      rank=_rank(), shuffle=True, seed=args.seed) if _world() > 1 else None
 
@@ -787,8 +871,11 @@ def main():
     p.add_argument("--lora_dropout", type=float, default=0.05)
     p.add_argument("--gradient_checkpointing", action="store_true")
     p.add_argument("--data_dir", default=None)
+    p.add_argument("--use_optimized_mix", action="store_true",
+                   help="Stage 1: use build_stage1_optimized_dataset (~5.1M instruction-aware mix)")
     p.add_argument("--mined_dir", default=None,
-                   help="If set, use build_mixed_dataset_mined with this dir of mined JSONLs")
+                   help="Stage 2: required for build_stage2_dataset. "
+                        "Stage 1 optimized mix: optional dir of mined *.jsonl (incl. classification_hn.jsonl).")
     p.add_argument("--image_dir", default=None)
     p.add_argument("--megapairs_image_dir", default=None)
     p.add_argument("--dataset_split", default="diverse_instruction")
