@@ -45,8 +45,10 @@ from train.dataset import (
     collate_embedding_batch, TaskStratifiedSampler,
 )
 from train.losses import (
-    classification_infonce_loss, cosent_loss, masked_infonce_loss,
-    mrl_classification_loss, mrl_cosent_loss, mrl_infonce_loss,
+    classification_infonce_loss, cosent_loss,
+    hardness_weighted_infonce_loss, masked_infonce_loss,
+    mrl_classification_loss, mrl_cosent_loss,
+    mrl_hardness_weighted_infonce_loss, mrl_infonce_loss,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -269,7 +271,8 @@ def _compute_loss(q_emb, p_emb, task_types, scores, args,
     losses = []
 
     # =======================================================================
-    # Stage 1: everything (except STS) gets plain InfoNCE on gathered q/p
+    # Stage 1: everything (except STS) gets InfoNCE on gathered q/p
+    # If hardness_alpha > 0, use hardness-weighted variant (LLaVE).
     # =======================================================================
     if stage == 1:
         non_sts_idx = [i for i, t in enumerate(task_types) if t != "sts"]
@@ -283,15 +286,31 @@ def _compute_loss(q_emb, p_emb, task_types, scores, args,
                 if K > 0 and mined_hn_gathered.shape[0] == Bg * K:
                     hn_reshaped = mined_hn_gathered.view(Bg, K, -1)
                     hn_ret = hn_reshaped[ci].reshape(-1, hn_reshaped.shape[-1])
+
+            use_hw = getattr(args, "hardness_alpha", 0.0) > 0.0
             if mrl:
-                losses.append(mrl_infonce_loss(
-                    q, p, hn_ret, mrl_dims=mrl,
-                    temperature=args.temperature, stage=1))
+                if use_hw:
+                    losses.append(mrl_hardness_weighted_infonce_loss(
+                        q, p, hn_ret, mrl_dims=mrl,
+                        temperature=args.temperature, alpha=args.hardness_alpha,
+                        stage=1))
+                else:
+                    losses.append(mrl_infonce_loss(
+                        q, p, hn_ret, mrl_dims=mrl,
+                        temperature=args.temperature, stage=1))
             else:
-                losses.append(masked_infonce_loss(
-                    F.normalize(q, dim=-1), F.normalize(p, dim=-1),
-                    F.normalize(hn_ret, dim=-1) if hn_ret is not None else None,
-                    temperature=args.temperature, stage=1))
+                qn = F.normalize(q, dim=-1)
+                pn = F.normalize(p, dim=-1)
+                hnn = F.normalize(hn_ret, dim=-1) if hn_ret is not None else None
+                if use_hw:
+                    losses.append(hardness_weighted_infonce_loss(
+                        qn, pn, hnn,
+                        temperature=args.temperature, alpha=args.hardness_alpha,
+                        stage=1))
+                else:
+                    losses.append(masked_infonce_loss(
+                        qn, pn, hnn,
+                        temperature=args.temperature, stage=1))
 
     # =======================================================================
     # Stage 2: per-task-type routing with hard negatives
@@ -896,6 +915,8 @@ def main():
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--temperature", type=float, default=0.02)
+    p.add_argument("--hardness_alpha", type=float, default=0.0,
+                   help="LLaVE hardness-weighted loss alpha (0=disabled, 9=paper default)")
     p.add_argument("--training_stage", type=int, default=1, choices=[1, 2])
     p.add_argument("--use_mrl", action="store_true", default=True)
     p.add_argument("--no_mrl", action="store_true")

@@ -13,6 +13,82 @@ from typing import List, Optional
 DEFAULT_MRL_DIMS = [1024, 256, 64]
 DEFAULT_TEMPERATURE = 0.02
 FALSE_NEGATIVE_MARGIN = 0.1
+DEFAULT_HARDNESS_ALPHA = 9.0
+
+
+def hardness_weighted_infonce_loss(
+    q: torch.Tensor, p: torch.Tensor,
+    hn: Optional[torch.Tensor] = None,
+    temperature: float = DEFAULT_TEMPERATURE,
+    alpha: float = DEFAULT_HARDNESS_ALPHA,
+    stage: int = 1,
+) -> torch.Tensor:
+    """Hardness-weighted InfoNCE (LLaVE, Eq. 4).
+
+    Each negative pair (q_i, t_j) is weighted by exp(α · sg(cos(q_i, t_j))),
+    amplifying gradients from hard negatives proportionally to their difficulty.
+
+    L_i = -log[ exp(s_pos/τ) / (exp(s_pos/τ) + Σ_{j≠i} exp(s_neg/τ + α·sg(s_neg))) ]
+
+    The stop-gradient (sg) on the similarity used for weighting means the reward
+    signal doesn't flow back — only the main loss gradient is affected.
+
+    Args:
+        q: (B, D) L2-normalized query embeddings
+        p: (B, D) L2-normalized positive doc embeddings
+        hn: (B*K, D) or None — hard negatives (K per query, flattened)
+        temperature: softmax temperature (τ)
+        alpha: hardness amplification factor (higher = more focus on hard negs)
+        stage: 1 = include q-q and d-d terms; 2 = only q-d cross
+    """
+    B, device = q.shape[0], q.device
+
+    pos = (q * p).sum(-1)                              # (B,)
+    Z = torch.exp(pos / temperature)                   # start with positive
+
+    eye = torch.eye(B, device=device, dtype=torch.bool)
+
+    def _weighted_contrib(scores):
+        """Negative contributions weighted by exp(α·sg(sim))."""
+        mask = ~eye
+        weights = torch.exp(alpha * scores.detach())
+        return (mask.float() * weights * torch.exp(scores / temperature)).sum(1)
+
+    # [2] hard negatives
+    if hn is not None and hn.shape[0] > 0 and hn.shape[0] % B == 0:
+        K = hn.shape[0] // B
+        hn_scores = torch.bmm(hn.view(B, K, -1), q.unsqueeze(-1)).squeeze(-1)  # (B, K)
+        hn_weights = torch.exp(alpha * hn_scores.detach())
+        Z = Z + (hn_weights * torch.exp(hn_scores / temperature)).sum(1)
+
+    # [5] q-d cross (always)
+    Z = Z + _weighted_contrib(q @ p.T)
+
+    if stage == 1:
+        # [3] q-q  and  [4] d-d
+        Z = Z + _weighted_contrib(q @ q.T)
+        Z = Z + _weighted_contrib(p @ p.T)
+
+    return -torch.log(torch.exp(pos / temperature) / (Z + 1e-12)).mean()
+
+
+def mrl_hardness_weighted_infonce_loss(
+    q: torch.Tensor, p: torch.Tensor,
+    hn: Optional[torch.Tensor] = None,
+    mrl_dims: List[int] = DEFAULT_MRL_DIMS,
+    temperature: float = DEFAULT_TEMPERATURE,
+    alpha: float = DEFAULT_HARDNESS_ALPHA,
+    stage: int = 1,
+) -> torch.Tensor:
+    """MRL wrapper over hardness-weighted InfoNCE."""
+    total = torch.tensor(0.0, device=q.device)
+    for d in mrl_dims:
+        qd = F.normalize(q[:, :d], dim=-1)
+        pd = F.normalize(p[:, :d], dim=-1)
+        hd = F.normalize(hn[:, :d], dim=-1) if hn is not None and hn.shape[0] > 0 else None
+        total = total + hardness_weighted_infonce_loss(
+            qd, pd, hd, temperature=temperature, alpha=alpha, stage=stage)
+    return total / len(mrl_dims)
 
 
 def masked_infonce_loss(
