@@ -251,3 +251,62 @@ def mrl_classification_loss(
         nd = F.normalize(neg_labels[:, :d], dim=-1) if K > 0 else neg_labels[:, :d]
         total = total + classification_infonce_loss(qd, pd, nd, temperature=temperature)
     return total / len(mrl_dims)
+
+
+# ---------------------------------------------------------------------------
+# Distillation losses (Stage 3: teacher → student knowledge transfer)
+# ---------------------------------------------------------------------------
+
+def distillation_kl_loss(
+    student_q: torch.Tensor, student_p: torch.Tensor,
+    teacher_q: torch.Tensor, teacher_p: torch.Tensor,
+    temperature: float = DEFAULT_TEMPERATURE,
+) -> torch.Tensor:
+    """KL-divergence between teacher and student similarity distributions.
+
+    Both student and teacher embeddings should be L2-normalized and at the
+    same dimensionality (1024). Computes soft similarity matrices and
+    minimizes the KL between their row-wise softmax distributions.
+    """
+    with torch.no_grad():
+        teacher_sim = teacher_q @ teacher_p.T / temperature
+        teacher_probs = F.softmax(teacher_sim, dim=-1)
+
+    student_sim = student_q @ student_p.T / temperature
+    student_log_probs = F.log_softmax(student_sim, dim=-1)
+
+    return F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
+
+
+def embedding_mse_loss(
+    student_emb: torch.Tensor, teacher_emb: torch.Tensor,
+) -> torch.Tensor:
+    """MSE between normalized student and teacher embeddings (same dim)."""
+    return F.mse_loss(student_emb, teacher_emb)
+
+
+def mrl_distillation_loss(
+    student_q: torch.Tensor, student_p: torch.Tensor,
+    teacher_q: torch.Tensor, teacher_p: torch.Tensor,
+    mrl_dims: List[int] = DEFAULT_MRL_DIMS,
+    temperature: float = DEFAULT_TEMPERATURE,
+    alpha_kl: float = 0.5,
+    alpha_mse: float = 0.2,
+) -> torch.Tensor:
+    """Combined MRL distillation: KL on similarity + MSE on embeddings.
+
+    Averages across Matryoshka dimensions. Teacher embeddings must be at least
+    as wide as max(mrl_dims).
+    """
+    total = torch.tensor(0.0, device=student_q.device)
+    for d in mrl_dims:
+        sq = F.normalize(student_q[:, :d], dim=-1)
+        sp = F.normalize(student_p[:, :d], dim=-1)
+        tq = F.normalize(teacher_q[:, :d], dim=-1)
+        tp = F.normalize(teacher_p[:, :d], dim=-1)
+
+        kl = distillation_kl_loss(sq, sp, tq, tp, temperature=temperature)
+        mse = embedding_mse_loss(sq, tq) + embedding_mse_loss(sp, tp)
+
+        total = total + alpha_kl * kl + alpha_mse * mse
+    return total / len(mrl_dims)

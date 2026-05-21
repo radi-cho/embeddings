@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
+import numpy as np
 from PIL import Image
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler
 
@@ -41,8 +42,9 @@ TASK_TYPE_MAP = {
     "classification": ["N24News", "HatefulMemes", "VOC2007", "SUN397", "ImageNet_1K"],
     "vqa": ["OK-VQA", "A-OKVQA", "DocVQA", "InfographicsVQA", "ChartQA",
              "Visual7W", "VisDial", "WebQA"],
-    "retrieval": ["MSCOCO", "MSCOCO_i2t", "MSCOCO_t2i",
+    "retrieval": ["MSCOCO_i2t", "MSCOCO_t2i",
                   "VisualNews_i2t", "VisualNews_t2i", "CIRR", "NIGHTS"],
+    "grounding": ["MSCOCO"],
 }
 
 HF_MMEB_REPO = "TIGER-Lab/MMEB-train"
@@ -582,11 +584,19 @@ def collate_embedding_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             if len(hns) == 0:
                 padded.append([dict(sentinel) for _ in range(max_k)])
             elif len(hns) < max_k:
-                # repeat the last one to reach max_k (still a hard neg, just dupe)
                 padded.append(list(hns) + [hns[-1]] * (max_k - len(hns)))
             else:
                 padded.append(hns[:max_k])
         out["hard_negatives"] = padded
+
+    # Teacher embeddings for distillation (Stage 3).
+    if "teacher_q_emb" in batch[0]:
+        import numpy as np
+        out["teacher_q_embs"] = torch.from_numpy(
+            np.stack([item["teacher_q_emb"] for item in batch]))
+        out["teacher_p_embs"] = torch.from_numpy(
+            np.stack([item["teacher_p_emb"] for item in batch]))
+
     return out
 
 
@@ -781,6 +791,233 @@ def build_stage1_optimized_dataset(
 
     combined = ConcatDataset(parts)
     logger.info("Stage1 optimized total: %d examples from %d sources",
+                len(combined), len(parts))
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# MMEB-full: all 20 MMEB training subsets (~1.07M) for balanced pretraining
+# ---------------------------------------------------------------------------
+
+MMEB_ALL_SUBSETS = [
+    "A-OKVQA", "CIRR", "ChartQA", "DocVQA", "HatefulMemes",
+    "ImageNet_1K", "InfographicsVQA", "MSCOCO", "MSCOCO_i2t",
+    "MSCOCO_t2i", "N24News", "NIGHTS", "OK-VQA", "SUN397",
+    "VOC2007", "VisDial", "Visual7W", "VisualNews_i2t",
+    "VisualNews_t2i", "WebQA",
+]
+
+
+def build_mmeb_full_dataset(
+    image_dir=None,
+    mmeb_split="diverse_instruction",
+    cache_dir=None,
+    max_samples_per_subset=None,
+):
+    """Load all 20 MMEB training subsets for balanced stage-1 pretraining.
+
+    Total ~1.07M examples covering classification, VQA, retrieval, and grounding.
+    If max_samples_per_subset is set, cap each subset (for faster iteration).
+    """
+    parts: List[Dataset] = []
+    for name in MMEB_ALL_SUBSETS:
+        try:
+            parts.append(MMEBDataset(
+                name, split=mmeb_split, image_dir=image_dir,
+                max_samples=max_samples_per_subset, cache_dir=cache_dir))
+        except Exception as e:
+            logger.error("MMEB-full '%s': %s", name, e)
+    if not parts:
+        raise RuntimeError("No MMEB data loaded")
+    combined = ConcatDataset(parts)
+    logger.info("MMEB-full total: %d examples from %d subsets", len(combined), len(parts))
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# Distillation dataset: MMEB + pre-computed teacher embeddings (Stage 3)
+# ---------------------------------------------------------------------------
+
+class DistillationMMEBDataset(Dataset):
+    """MMEB dataset augmented with pre-computed teacher embeddings.
+
+    Wraps the standard MMEBDataset and attaches teacher query/positive
+    embeddings loaded from numpy memory-mapped arrays on disk.
+    """
+
+    def __init__(self, subset_name, teacher_dir, split="diverse_instruction",
+                 image_dir=None, max_samples=None, cache_dir=None):
+        self._base = MMEBDataset(subset_name, split=split, image_dir=image_dir,
+                                 max_samples=max_samples, cache_dir=cache_dir)
+        teacher_path = Path(teacher_dir)
+        q_path = teacher_path / f"{subset_name}_queries.npy"
+        p_path = teacher_path / f"{subset_name}_positives.npy"
+        if not q_path.exists() or not p_path.exists():
+            raise FileNotFoundError(
+                f"Teacher embeddings not found: {q_path} or {p_path}")
+        self._teacher_q = np.load(str(q_path), mmap_mode='r')
+        self._teacher_p = np.load(str(p_path), mmap_mode='r')
+        assert len(self._teacher_q) >= len(self._base), (
+            f"Teacher embeddings ({len(self._teacher_q)}) < dataset ({len(self._base)})")
+        logger.info("DistillMMEB '%s': %d examples, teacher_dim=%d",
+                    subset_name, len(self._base), self._teacher_q.shape[1])
+
+    def __len__(self):
+        return len(self._base)
+
+    def __getitem__(self, idx):
+        item = self._base[idx]
+        item["teacher_q_emb"] = self._teacher_q[idx].astype(np.float32)
+        item["teacher_p_emb"] = self._teacher_p[idx].astype(np.float32)
+        return item
+
+
+def build_mmeb_distill_dataset(
+    teacher_dir,
+    image_dir=None,
+    mmeb_split="diverse_instruction",
+    cache_dir=None,
+    max_samples_per_subset=None,
+):
+    """Load all 20 MMEB subsets with pre-computed teacher embeddings for distillation."""
+    parts: List[Dataset] = []
+    for name in MMEB_ALL_SUBSETS:
+        try:
+            parts.append(DistillationMMEBDataset(
+                name, teacher_dir=teacher_dir, split=mmeb_split,
+                image_dir=image_dir, max_samples=max_samples_per_subset,
+                cache_dir=cache_dir))
+        except Exception as e:
+            logger.error("DistillMMEB '%s': %s", name, e)
+    if not parts:
+        raise RuntimeError("No distillation MMEB data loaded")
+    combined = ConcatDataset(parts)
+    logger.info("MMEB-distill total: %d examples from %d subsets", len(combined), len(parts))
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# Stage-1 v2: 1.28M-sample mix (expanded LoRA, 4096 ctx, video, mined HNs)
+# ---------------------------------------------------------------------------
+
+V2_CAP_MMEB_TOTAL = 320_000
+V2_CAP_MEGAPAIRS = 280_000
+V2_CAP_MSMARCO = 130_000
+V2_CAP_GOOAQ = 90_000
+V2_CAP_MINED_RETRIEVAL = 180_000
+V2_CAP_MINED_CLASSIFICATION = 55_000
+V2_CAP_VIDEO = 80_000
+V2_CAP_ALLNLI = 45_000
+V2_CAP_COLPALI = 35_000
+V2_CAP_QUORA = 19_251
+
+
+def build_stage1_v2_dataset(
+    data_dir,
+    image_dir=None,
+    megapairs_image_dir=None,
+    mined_dir=None,
+    mmeb_split="diverse_instruction",
+    cache_dir=None,
+):
+    """1.28M-sample Stage-1 mix for expanded-LoRA 5k-step run.
+
+    Includes mined hard negatives and video (LLaVA-Hound).
+    """
+    base = Path(data_dir)
+    mined_root = Path(mined_dir) if mined_dir else None
+    parts: List[Dataset] = []
+
+    # --- MegaPairs ---------------------------------------------------------
+    p = base / "megapairs" / "train.jsonl"
+    if p.is_file():
+        try:
+            parts.append(MegaPairsDataset(
+                str(p), megapairs_image_dir or image_dir, V2_CAP_MEGAPAIRS))
+        except Exception as e:
+            logger.error("MegaPairs (v2): %s", e)
+
+    # --- MMEB (all 20 subsets, balanced internal split) --------------------
+    all_mmeb = STAGE1_RETRIEVAL_SUBSETS + STAGE1_VQA_SUBSETS + STAGE1_CLASSIFICATION_SUBSETS
+    mmeb_caps = _split_budget(V2_CAP_MMEB_TOTAL, len(all_mmeb))
+    for name, cap in zip(all_mmeb, mmeb_caps):
+        try:
+            parts.append(MMEBDataset(
+                name, split=mmeb_split, image_dir=image_dir,
+                max_samples=cap, cache_dir=cache_dir))
+        except Exception as e:
+            logger.error("MMEB v2 '%s': %s", name, e)
+
+    # --- Text triplets -----------------------------------------------------
+    p = base / "msmarco" / "train.jsonl"
+    if p.is_file():
+        parts.append(TextTripletDataset(str(p), "msmarco", V2_CAP_MSMARCO))
+    p = base / "gooaq" / "train.jsonl"
+    if p.is_file():
+        parts.append(TextTripletDataset(str(p), "gooaq", V2_CAP_GOOAQ))
+    p = base / "allnli" / "train.jsonl"
+    if p.is_file():
+        parts.append(TextTripletDataset(str(p), "allnli", V2_CAP_ALLNLI))
+    p = base / "quora" / "train.jsonl"
+    if p.is_file():
+        parts.append(TextTripletDataset(str(p), "quora", V2_CAP_QUORA))
+
+    # --- STS-B (full; ~5.7k) ----------------------------------------------
+    p = base / "stsb" / "train.jsonl"
+    if p.is_file():
+        parts.append(STSDataset(str(p)))
+
+    # --- ColPali -----------------------------------------------------------
+    p = base / "colpali" / "data"
+    if p.is_dir():
+        try:
+            parts.append(ColPaliDataset(str(p), V2_CAP_COLPALI))
+        except Exception as e:
+            logger.error("ColPali (v2): %s", e)
+
+    # --- Video (LLaVA-Hound) ----------------------------------------------
+    p = base / "llava_hound" / "train.jsonl"
+    if p.is_file():
+        parts.append(VideoTripletDataset(
+            str(p), video_root=str(base), subset_name="llava_hound",
+            max_samples=V2_CAP_VIDEO))
+
+    # --- Mined: retrieval / VQA / text (exclude classification_hn) ---------
+    cls_mined_name = "classification_hn.jsonl"
+    if mined_root and mined_root.is_dir():
+        mined_files = sorted(
+            fp for fp in mined_root.glob("*.jsonl")
+            if fp.name != cls_mined_name and fp.stat().st_size > 0
+        )
+        if mined_files:
+            m_caps = _split_budget(V2_CAP_MINED_RETRIEVAL, len(mined_files))
+            for fp, cap in zip(mined_files, m_caps):
+                sname = fp.stem[len("mmeb_"):] if fp.stem.startswith("mmeb_") else fp.stem
+                try:
+                    parts.append(MinedNegativesDataset(
+                        str(fp), image_dir=image_dir, max_samples=cap,
+                        max_hard_negatives=15, subset_name=sname))
+                except Exception as e:
+                    logger.error("MinedNeg v2 '%s': %s", fp.name, e)
+        fp_cls = mined_root / cls_mined_name
+        if fp_cls.is_file() and fp_cls.stat().st_size > 0:
+            try:
+                parts.append(MinedNegativesDataset(
+                    str(fp_cls), image_dir=image_dir,
+                    max_samples=V2_CAP_MINED_CLASSIFICATION,
+                    max_hard_negatives=15, subset_name="classification_hn"))
+            except Exception as e:
+                logger.error("Mined cls HN v2: %s", e)
+    else:
+        logger.warning(
+            "build_stage1_v2_dataset: mined_dir missing (%s); continuing without mined data",
+            mined_dir)
+
+    if not parts:
+        raise RuntimeError(f"No data for v2 Stage-1 mix under {data_dir}")
+
+    combined = ConcatDataset(parts)
+    logger.info("Stage1 v2 total: %d examples from %d sources",
                 len(combined), len(parts))
     return combined
 

@@ -40,12 +40,14 @@ from transformers import get_cosine_schedule_with_warmup
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from train.dataset import (
-    build_dataloader, build_mixed_dataset, build_stage1_optimized_dataset,
-    build_stage2_dataset,
+    build_dataloader, build_mixed_dataset, build_mmeb_distill_dataset,
+    build_mmeb_full_dataset, build_stage1_optimized_dataset,
+    build_stage1_v2_dataset, build_stage2_dataset,
     collate_embedding_batch, TaskStratifiedSampler,
 )
 from train.losses import (
     classification_infonce_loss, cosent_loss,
+    distillation_kl_loss, embedding_mse_loss, mrl_distillation_loss,
     hardness_weighted_infonce_loss, masked_infonce_loss,
     mrl_classification_loss, mrl_cosent_loss,
     mrl_hardness_weighted_infonce_loss, mrl_infonce_loss,
@@ -155,7 +157,12 @@ if _patch_gdn_bf16():
     logger.info("Patched Qwen3_5GatedDeltaNet for bf16 gating (fla fast path)")
 
 LORA_TARGETS = {
-    "qwen35": ["q_proj", "k_proj", "v_proj", "up_proj", "down_proj", "gate_proj"],
+    "qwen35": [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "up_proj", "down_proj", "gate_proj",
+        "in_proj_qkv", "in_proj_a", "in_proj_b", "in_proj_z", "out_proj",
+        "qkv", "proj", "linear_fc1", "linear_fc2",
+    ],
     "qwen3vl": ["q_proj", "k_proj", "v_proj", "up_proj", "down_proj", "gate_proj",
                  "o_proj", "in_proj_a", "in_proj_b", "in_proj_qkv", "in_proj_z", "out_proj"],
 }
@@ -281,11 +288,18 @@ def _compute_loss(q_emb, p_emb, task_types, scores, args,
             q, p = q_emb[ci], p_emb[ci]
             hn_ret = None
             if mined_hn_gathered is not None and mined_hn_gathered.shape[0] > 0:
-                Bg = q_emb.shape[0]
-                K = mined_hn_gathered.shape[0] // Bg if Bg > 0 else 0
-                if K > 0 and mined_hn_gathered.shape[0] == Bg * K:
-                    hn_reshaped = mined_hn_gathered.view(Bg, K, -1)
-                    hn_ret = hn_reshaped[ci].reshape(-1, hn_reshaped.shape[-1])
+                # mined HNs are local-only (not gathered); index by local batch.
+                Bl = q_local.shape[0] if q_local is not None else 0
+                K = mined_hn_gathered.shape[0] // Bl if Bl > 0 else 0
+                if K > 0 and Bl > 0 and mined_hn_gathered.shape[0] == Bl * K:
+                    hn_reshaped = mined_hn_gathered.view(Bl, K, -1)
+                    rank = _rank()
+                    local_ci = [i - rank * Bl for i in non_sts_idx
+                                if rank * Bl <= i < (rank + 1) * Bl]
+                    if local_ci:
+                        local_ci_t = torch.tensor(local_ci, device=device)
+                        hn_ret = hn_reshaped[local_ci_t].reshape(
+                            -1, hn_reshaped.shape[-1])
 
             use_hw = getattr(args, "hardness_alpha", 0.0) > 0.0
             if mrl:
@@ -342,7 +356,7 @@ def _compute_loss(q_emb, p_emb, task_types, scores, args,
                         F.normalize(q, dim=-1), F.normalize(p, dim=-1), None,
                         temperature=args.temperature, stage=stage))
 
-        # Retrieval / VQA: gathered in-batch + gathered mined HNs
+        # Retrieval / VQA: gathered in-batch + local mined HNs
         if con_idx:
             ci = torch.tensor(con_idx, device=device)
             q_ret = q_emb[ci]
@@ -350,11 +364,18 @@ def _compute_loss(q_emb, p_emb, task_types, scores, args,
 
             hn_ret = None
             if mined_hn_gathered is not None and mined_hn_gathered.shape[0] > 0:
-                B_gathered = q_emb.shape[0]
-                K = mined_hn_gathered.shape[0] // B_gathered if B_gathered > 0 else 0
-                if K > 0 and mined_hn_gathered.shape[0] == B_gathered * K:
-                    hn_reshaped = mined_hn_gathered.view(B_gathered, K, -1)
-                    hn_ret = hn_reshaped[ci].reshape(-1, hn_reshaped.shape[-1])
+                # mined HNs are local-only; index by local batch.
+                Bl = q_local.shape[0] if q_local is not None else 0
+                K = mined_hn_gathered.shape[0] // Bl if Bl > 0 else 0
+                if K > 0 and Bl > 0 and mined_hn_gathered.shape[0] == Bl * K:
+                    hn_reshaped = mined_hn_gathered.view(Bl, K, -1)
+                    rank = _rank()
+                    local_ci = [i - rank * Bl for i in con_idx
+                                if rank * Bl <= i < (rank + 1) * Bl]
+                    if local_ci:
+                        local_ci_t = torch.tensor(local_ci, device=device)
+                        hn_ret = hn_reshaped[local_ci_t].reshape(
+                            -1, hn_reshaped.shape[-1])
 
             if mrl:
                 losses.append(mrl_infonce_loss(
@@ -381,6 +402,44 @@ def _compute_loss(q_emb, p_emb, task_types, scores, args,
     if not losses:
         return torch.tensor(0.0, device=device, requires_grad=True)
     return sum(losses) / len(losses)
+
+
+def _compute_stage3_loss(q_emb, p_emb, teacher_q, teacher_p, args):
+    """Stage 3 distillation: KL + MSE + contrastive (all at MRL dims)."""
+    mrl = args.mrl_dims if args.use_mrl else None
+    device = q_emb.device
+    temperature = args.temperature
+    alpha_con = getattr(args, 'distill_alpha_con', 0.3)
+    alpha_kl = getattr(args, 'distill_alpha_kl', 0.5)
+    alpha_mse = getattr(args, 'distill_alpha_mse', 0.2)
+
+    if mrl:
+        total_con = torch.tensor(0.0, device=device)
+        total_distill = torch.tensor(0.0, device=device)
+        for d in mrl:
+            sq = F.normalize(q_emb[:, :d], dim=-1)
+            sp = F.normalize(p_emb[:, :d], dim=-1)
+            tq = F.normalize(teacher_q[:, :d], dim=-1)
+            tp = F.normalize(teacher_p[:, :d], dim=-1)
+
+            total_con = total_con + masked_infonce_loss(
+                sq, sp, None, temperature=temperature, stage=1)
+            total_distill = total_distill + (
+                alpha_kl * distillation_kl_loss(sq, sp, tq, tp, temperature) +
+                alpha_mse * (embedding_mse_loss(sq, tq) + embedding_mse_loss(sp, tp)))
+        loss_con = total_con / len(mrl)
+        loss_distill = total_distill / len(mrl)
+    else:
+        sq = F.normalize(q_emb, dim=-1)
+        sp = F.normalize(p_emb, dim=-1)
+        tq = F.normalize(teacher_q, dim=-1)
+        tp = F.normalize(teacher_p, dim=-1)
+        loss_con = masked_infonce_loss(sq, sp, None, temperature=temperature, stage=1)
+        loss_distill = (
+            alpha_kl * distillation_kl_loss(sq, sp, tq, tp, temperature) +
+            alpha_mse * (embedding_mse_loss(sq, tq) + embedding_mse_loss(sp, tp)))
+
+    return alpha_con * loss_con + loss_distill
 
 
 # ---------------------------------------------------------------------------
@@ -421,15 +480,18 @@ def _train_step(embedder, model, device, batch, args):
     manually all-reduced after a successful backward on all ranks.
     Returns loss float, or None if any rank OOMed at any phase.
 
-    With gradient checkpointing enabled, OOMs during backward can manifest as
-    RuntimeError or even non-Python CUDA errors that bypass the normal
-    try/except. We catch *all* exceptions during backward, and also proactively
-    skip steps when free GPU memory is dangerously low before backward begins.
+    Critical: we must not call ``GatherWithGrad`` (all_gather) until every
+    rank has finished forward and agreed via ``all_reduce(MIN)`` on an
+    ``encode_ok`` flag. Otherwise one rank that OOMs or hits an async CUDA
+    error before the gather will leave others stuck in NCCL until timeout.
+    ``torch.cuda.synchronize(device)`` after forward forces async errors
+    into the Python ``try`` block where we can set ``encode_ok=0`` uniformly.
     """
     sq, sp = _get_streams(device)
     bs = len(batch["queries"])
     hidden_dim = _hidden_size_from_model(model)
     oom = False
+    encode_ok = True
 
     # --- Phase 1: forward encode (inside no_sync so no DDP hooks) ----------
     no_sync = model.no_sync if hasattr(model, "no_sync") else contextlib.nullcontext
@@ -462,72 +524,96 @@ def _train_step(embedder, model, device, batch, args):
             if mined_hns and max(len(h) for h in mined_hns) > 0:
                 flat = [h for row in mined_hns for h in row]
                 if flat:
-                    _hn_bs = bs
                     hn_parts = []
-                    for _i in range(0, len(flat), _hn_bs):
+                    for _i in range(0, len(flat), bs):
                         hn_parts.append(
-                            _encode_batch(model, embedder, flat[_i:_i + _hn_bs], device))
+                            _encode_batch(model, embedder, flat[_i:_i + bs], device))
                     mined_hn_local = torch.cat(hn_parts, dim=0)
+            if torch.cuda.is_available() and getattr(device, "type", str(device)) == "cuda":
+                torch.cuda.synchronize(device)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             oom = True
+            encode_ok = False
             q_local = torch.zeros(bs, hidden_dim, device=device, dtype=torch.bfloat16)
             p_local = torch.zeros(bs, hidden_dim, device=device, dtype=torch.bfloat16)
             hn_local = None
             mined_hn_local = None
             logger.warning("OOM during forward on rank %d", _rank())
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "out of memory" in msg or "cuda out of memory" in msg:
+                torch.cuda.empty_cache()
+                oom = True
+                encode_ok = False
+                q_local = torch.zeros(bs, hidden_dim, device=device, dtype=torch.bfloat16)
+                p_local = torch.zeros(bs, hidden_dim, device=device, dtype=torch.bfloat16)
+                hn_local = None
+                mined_hn_local = None
+                logger.warning("CUDA OOM (RuntimeError) during forward on rank %d: %s",
+                               _rank(), str(e)[:200])
+            else:
+                raise
+
+    # All ranks must agree before any all_gather — avoids NCCL deadlock.
+    ok = torch.tensor([1.0 if encode_ok else 0.0], device=device)
+    if _world() > 1:
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN)
+    if ok.item() < 1.0:
+        torch.cuda.empty_cache()
+        return None
 
     q = GatherWithGrad.apply(q_local) if _world() > 1 else q_local
     p = GatherWithGrad.apply(p_local) if _world() > 1 else p_local
-    mined_hn_gathered = None
-    if mined_hn_local is not None and _world() > 1:
-        mined_hn_gathered = GatherWithGrad.apply(mined_hn_local)
-    elif mined_hn_local is not None:
-        mined_hn_gathered = mined_hn_local
 
-    oom_flag = torch.tensor([1.0 if oom else 0.0], device=device)
-    if _world() > 1:
-        dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX)
-    if oom_flag.item() > 0:
-        return None
-
-    # --- Pre-backward memory check: skip if recomputation will likely OOM ---
-    # Gradient checkpointing roughly doubles peak memory during backward vs.
-    # forward-only because activations are recomputed. If free memory after
-    # forward is below a safety threshold, skip proactively.
-    if torch.cuda.is_available():
-        free_mem, total_mem = torch.cuda.mem_get_info(device)
-        used_frac = 1.0 - (free_mem / total_mem)
-        if used_frac > 0.92:
-            torch.cuda.empty_cache()
-            free_mem, total_mem = torch.cuda.mem_get_info(device)
-            used_frac = 1.0 - (free_mem / total_mem)
-            if used_frac > 0.90:
-                logger.warning(
-                    "Proactive skip: %.1f%% GPU memory used after forward on rank %d "
-                    "(free=%.0fMB); skipping backward to avoid OOM during recomputation.",
-                    used_frac * 100, _rank(), free_mem / 1e6)
-                oom = True
-                oom_flag.fill_(1.0)
-                if _world() > 1:
-                    dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX)
-                for param in model.parameters():
-                    if param.grad is not None:
-                        param.grad.zero_()
-                return None
+    # Mined hard negatives are NOT gathered across ranks:
+    # 1. They are query-specific (each HN is negative for its paired query only),
+    #    so global sharing is semantically wrong.
+    # 2. Different ranks may have different numbers of HNs, causing NCCL size
+    #    mismatch → SIGABRT in all_gather.
+    # Instead, pass mined_hn_local directly; the loss function indexes into it
+    # using the local rank's query indices.
+    mined_hn_gathered = mined_hn_local
 
     # --- Phase 2: loss + backward (still no DDP sync — manual reduce after) -
-    scores = batch["scores"].to(device) if batch["scores"] is not None else None
-    g_tt, g_scores = _gather_metadata(batch["task_types"], scores, device)
-    loss = _compute_loss(q, p, g_tt, g_scores, args,
-                         q_local=q_local, p_local=p_local,
-                         local_task_types=batch["task_types"], hn_emb=hn_local,
-                         mined_hn_gathered=mined_hn_gathered)
+    if args.training_stage == 3 and "teacher_q_embs" in batch:
+        # Stage 3: distillation from pre-computed teacher embeddings.
+        teacher_q_local = batch["teacher_q_embs"].to(device)
+        teacher_p_local = batch["teacher_p_embs"].to(device)
+        # Gather teacher embeddings across ranks (no grad needed).
+        if _world() > 1:
+            tq_gathered = [torch.zeros_like(teacher_q_local) for _ in range(_world())]
+            tp_gathered = [torch.zeros_like(teacher_p_local) for _ in range(_world())]
+            dist.all_gather(tq_gathered, teacher_q_local.contiguous())
+            dist.all_gather(tp_gathered, teacher_p_local.contiguous())
+            teacher_q = torch.cat(tq_gathered, dim=0)
+            teacher_p = torch.cat(tp_gathered, dim=0)
+        else:
+            teacher_q = teacher_q_local
+            teacher_p = teacher_p_local
+        loss = _compute_stage3_loss(q, p, teacher_q, teacher_p, args)
+        del teacher_q, teacher_p, teacher_q_local, teacher_p_local
+    else:
+        scores = batch["scores"].to(device) if batch["scores"] is not None else None
+        g_tt, g_scores = _gather_metadata(batch["task_types"], scores, device)
+        loss = _compute_loss(q, p, g_tt, g_scores, args,
+                             q_local=q_local, p_local=p_local,
+                             local_task_types=batch["task_types"], hn_emb=hn_local,
+                             mined_hn_gathered=mined_hn_gathered)
+        del g_tt, g_scores, scores
     loss_val = loss.detach().float().item()
+
+    # Free intermediate references (the computation graph keeps actual tensors alive).
+    del q, p, mined_hn_gathered
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(device)
 
     with no_sync():
         try:
             loss.backward()
+            if torch.cuda.is_available() and getattr(device, "type", str(device)) == "cuda":
+                torch.cuda.synchronize(device)
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             oom = True
@@ -536,28 +622,22 @@ def _train_step(embedder, model, device, batch, args):
                 if param.grad is not None:
                     param.grad.zero_()
         except RuntimeError as e:
-            # Gradient checkpointing recomputation can raise RuntimeError wrapping
-            # a CUDA OOM or other CUDA error instead of OutOfMemoryError directly.
-            torch.cuda.empty_cache()
-            oom = True
-            logger.warning("RuntimeError during backward on rank %d: %s", _rank(), str(e)[:200])
-            for param in model.parameters():
-                if param.grad is not None:
-                    param.grad.zero_()
-        except Exception as e:
-            # Catch-all for any other unexpected exception during backward to
-            # prevent one rank from dying and causing NCCL timeout on others.
-            torch.cuda.empty_cache()
-            oom = True
-            logger.error("Unexpected error during backward on rank %d: %s", _rank(), str(e)[:200])
-            for param in model.parameters():
-                if param.grad is not None:
-                    param.grad.zero_()
+            msg = str(e).lower()
+            if "out of memory" in msg or "cuda out of memory" in msg:
+                torch.cuda.empty_cache()
+                oom = True
+                logger.warning("CUDA OOM (RuntimeError) during backward on rank %d: %s",
+                               _rank(), str(e)[:200])
+                for param in model.parameters():
+                    if param.grad is not None:
+                        param.grad.zero_()
+            else:
+                raise
 
-    oom_flag.fill_(1.0 if oom else 0.0)
+    bwd_oom = torch.tensor([1.0 if oom else 0.0], device=device)
     if _world() > 1:
-        dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX)
-    if oom_flag.item() > 0:
+        dist.all_reduce(bwd_oom, op=dist.ReduceOp.MAX)
+    if bwd_oom.item() > 0:
         for param in model.parameters():
             if param.grad is not None:
                 param.grad.zero_()
@@ -663,6 +743,43 @@ def _build_dataloader(args, embedder, batch_size):
     subsets = args.subsets.split(",") if args.subsets else None
     tt_filter = args.task_types.split(",") if args.task_types else None
 
+    from torch.utils.data import DistributedSampler
+
+    # Stage 3 distillation: MMEB with pre-computed teacher embeddings.
+    if args.training_stage == 3 and getattr(args, 'teacher_embed_dir', None):
+        dataset = build_mmeb_distill_dataset(
+            teacher_dir=args.teacher_embed_dir,
+            image_dir=args.image_dir,
+            mmeb_split=args.dataset_split,
+            cache_dir=args.cache_dir,
+        )
+        sampler = DistributedSampler(
+            dataset, num_replicas=_world(), rank=_rank(),
+            shuffle=True, seed=args.seed) if _world() > 1 else None
+        return DataLoader(dataset, batch_size=batch_size,
+                          sampler=sampler, shuffle=(sampler is None),
+                          collate_fn=collate_embedding_batch,
+                          num_workers=args.num_workers, drop_last=True,
+                          pin_memory=True, persistent_workers=args.num_workers > 0,
+                          prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None)
+
+    # MMEB-full: all 20 subsets, no external data_dir needed.
+    if args.use_optimized_mix and args.data_mix_version == "mmeb_full":
+        dataset = build_mmeb_full_dataset(
+            image_dir=args.image_dir,
+            mmeb_split=args.dataset_split,
+            cache_dir=args.cache_dir,
+        )
+        sampler = DistributedSampler(
+            dataset, num_replicas=_world(), rank=_rank(),
+            shuffle=True, seed=args.seed) if _world() > 1 else None
+        return DataLoader(dataset, batch_size=batch_size,
+                          sampler=sampler, shuffle=(sampler is None),
+                          collate_fn=collate_embedding_batch,
+                          num_workers=args.num_workers, drop_last=True,
+                          pin_memory=True, persistent_workers=args.num_workers > 0,
+                          prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None)
+
     # Without a data_dir root we fall back to the legacy MMEB-only builder.
     if not args.data_dir:
         return build_dataloader(
@@ -670,8 +787,6 @@ def _build_dataloader(args, embedder, batch_size):
             image_dir=args.image_dir, max_samples_per_subset=args.max_samples_per_subset,
             cache_dir=args.cache_dir,
             batch_size=batch_size, num_workers=args.num_workers, shuffle=True)
-
-    from torch.utils.data import DistributedSampler
 
     # Stage 2: curated mined mix + stratified batches.
     if args.training_stage == 2 and args.mined_dir:
@@ -685,14 +800,30 @@ def _build_dataloader(args, embedder, batch_size):
             dataset, batch_size=batch_size,
             num_replicas=_world(), rank=_rank(), seed=args.seed)
     elif args.use_optimized_mix:
-        dataset = build_stage1_optimized_dataset(
-            data_dir=args.data_dir,
-            image_dir=args.image_dir,
-            megapairs_image_dir=args.megapairs_image_dir,
-            mined_dir=args.mined_dir,
-            mmeb_split=args.dataset_split,
-            cache_dir=args.cache_dir,
-        )
+        if args.data_mix_version == "mmeb_full":
+            dataset = build_mmeb_full_dataset(
+                image_dir=args.image_dir,
+                mmeb_split=args.dataset_split,
+                cache_dir=args.cache_dir,
+            )
+        elif args.data_mix_version == "v2":
+            dataset = build_stage1_v2_dataset(
+                data_dir=args.data_dir,
+                image_dir=args.image_dir,
+                megapairs_image_dir=args.megapairs_image_dir,
+                mined_dir=args.mined_dir,
+                mmeb_split=args.dataset_split,
+                cache_dir=args.cache_dir,
+            )
+        else:
+            dataset = build_stage1_optimized_dataset(
+                data_dir=args.data_dir,
+                image_dir=args.image_dir,
+                megapairs_image_dir=args.megapairs_image_dir,
+                mined_dir=args.mined_dir,
+                mmeb_split=args.dataset_split,
+                cache_dir=args.cache_dir,
+            )
         sampler = DistributedSampler(
             dataset, num_replicas=_world(), rank=_rank(),
             shuffle=True, seed=args.seed) if _world() > 1 else None
@@ -724,6 +855,12 @@ def train(args):
         log_with="wandb" if args.use_wandb else None,
         mixed_precision="bf16",
         kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(minutes=5))])
+
+    # Cap per-process CUDA memory at 95% so the allocator raises a catchable
+    # OutOfMemoryError instead of letting the driver SIGABRT the process.
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            torch.cuda.set_per_process_memory_fraction(0.95, i)
 
     set_seed(args.seed)
     if accelerator.is_main_process:
@@ -762,12 +899,15 @@ def train(args):
     else:
         embedder = _load_embedder(args.model_path, args.max_length, mt, args.max_pixels,
                                   args.video_total_pixels)
-        embedder.model = get_peft_model(embedder.model, LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION, r=args.lora_rank,
-            lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
-            target_modules=LORA_TARGETS[mt]))
+        if not getattr(args, 'no_lora', False):
+            embedder.model = get_peft_model(embedder.model, LoraConfig(
+                task_type=TaskType.FEATURE_EXTRACTION, r=args.lora_rank,
+                lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+                target_modules=LORA_TARGETS[mt]))
     if accelerator.is_main_process:
-        embedder.model.print_trainable_parameters()
+        n_train = sum(p.numel() for p in embedder.model.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in embedder.model.parameters())
+        accelerator.print(f"  Trainable: {n_train:,} / {n_total:,} ({n_train/n_total*100:.1f}%)")
     if args.gradient_checkpointing:
         embedder.model.enable_input_require_grads()
         embedder.model.gradient_checkpointing_enable()
@@ -888,13 +1028,16 @@ def main():
     p.add_argument("--lora_rank", type=int, default=32)
     p.add_argument("--lora_alpha", type=int, default=32)
     p.add_argument("--lora_dropout", type=float, default=0.05)
+    p.add_argument("--no_lora", action="store_true", help="Full fine-tune, skip LoRA")
     p.add_argument("--gradient_checkpointing", action="store_true")
     p.add_argument("--data_dir", default=None)
     p.add_argument("--use_optimized_mix", action="store_true",
-                   help="Stage 1: use build_stage1_optimized_dataset (~5.1M instruction-aware mix)")
+                   help="Stage 1: use optimized dataset builder (v1 or v2 per --data_mix_version)")
+    p.add_argument("--data_mix_version", default="v1", choices=["v1", "v2", "mmeb_full"],
+                   help="v1: ~5.1M instruction-aware mix; v2: 1.28M expanded-LoRA mix with mined HNs + video")
     p.add_argument("--mined_dir", default=None,
-                   help="Stage 2: required for build_stage2_dataset. "
-                        "Stage 1 optimized mix: optional dir of mined *.jsonl (incl. classification_hn.jsonl).")
+                   help="Dir of mined *.jsonl (incl. classification_hn.jsonl). "
+                        "Used by Stage 2 and Stage 1 v2 mix.")
     p.add_argument("--image_dir", default=None)
     p.add_argument("--megapairs_image_dir", default=None)
     p.add_argument("--dataset_split", default="diverse_instruction")
@@ -917,7 +1060,15 @@ def main():
     p.add_argument("--temperature", type=float, default=0.02)
     p.add_argument("--hardness_alpha", type=float, default=0.0,
                    help="LLaVE hardness-weighted loss alpha (0=disabled, 9=paper default)")
-    p.add_argument("--training_stage", type=int, default=1, choices=[1, 2])
+    p.add_argument("--training_stage", type=int, default=1, choices=[1, 2, 3])
+    p.add_argument("--teacher_embed_dir", default=None,
+                   help="Dir with pre-computed teacher .npy embeddings (stage 3)")
+    p.add_argument("--distill_alpha_con", type=float, default=0.3,
+                   help="Weight for contrastive loss in stage 3 distillation")
+    p.add_argument("--distill_alpha_kl", type=float, default=0.5,
+                   help="Weight for KL-div distillation loss in stage 3")
+    p.add_argument("--distill_alpha_mse", type=float, default=0.2,
+                   help="Weight for MSE embedding loss in stage 3")
     p.add_argument("--use_mrl", action="store_true", default=True)
     p.add_argument("--no_mrl", action="store_true")
     p.add_argument("--mrl_dims", default="1024,256,64")
