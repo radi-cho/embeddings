@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
-# Contrastive pretraining for Qwen3.5-0.8B multimodal embedding model.
-#
-# Simple DDP -- each GPU encodes batch_size items, embeddings are gathered
-# across GPUs for contrastive loss.  Effective batch = batch_size * num_gpus.
-#
-# For 8 GPUs:  128/GPU -> 1024 effective (target)
+# Stage 1 pretraining on full MMEB dataset (all 20 subsets, ~1.07M samples).
+# Balanced across classification, VQA, retrieval, and grounding.
+# 1 epoch, low LR, cross-device negative gathering via GatherWithGrad.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -19,17 +16,14 @@ fi
 
 : "${CUDA_DEVICES:=0,1,2,3,4,5,6,7}"
 : "${MODEL_PATH:=${ROOT}/models/checkpoints/Qwen3.5-0.8B}"
-: "${OUTPUT_DIR:=${ROOT}/data/outputs/stage1-expanded-lora-5k}"
+: "${OUTPUT_DIR:=${ROOT}/data/outputs/stage1-mmeb-full}"
 : "${IMAGE_DIR:=${ROOT}/datasets/mmeb_train_images/images}"
-: "${MEGAPAIRS_IMAGE_DIR:=${ROOT}/data/megapairs_images}"
-: "${DATA_DIR:=${ROOT}/data/training_data}"
-: "${MINED_DIR:=${ROOT}/data/training_data_mined}"
 
 : "${BATCH_SIZE:=32}"
 : "${GRAD_ACCUM:=1}"
 : "${EPOCHS:=1}"
-: "${MAX_STEPS:=5000}"
-: "${LR:=1e-4}"
+: "${MAX_STEPS:=0}"
+: "${LR:=1e-5}"
 : "${TEMPERATURE:=0.02}"
 : "${MAX_LENGTH:=4096}"
 : "${MAX_PIXELS:=1310720}"
@@ -43,14 +37,13 @@ fi
 : "${PREFETCH_FACTOR:=4}"
 : "${SEED:=42}"
 : "${GRADIENT_CHECKPOINTING:=true}"
-: "${COMPILE:=false}"
 : "${USE_OPTIMIZED_MIX:=true}"
-: "${DATA_MIX_VERSION:=v2}"
+: "${DATA_MIX_VERSION:=mmeb_full}"
 
 : "${USE_WANDB:=true}"
 : "${WANDB_PROJECT:=embeddings}"
 : "${WANDB_ENTITY:=radi-and-people}"
-: "${WANDB_RUN_NAME:=stage1-expanded-lora-4096-5k-8xH100}"
+: "${WANDB_RUN_NAME:=stage1-mmeb-full-1e5-8xH100}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.7
@@ -59,7 +52,7 @@ NUM_GPUS=${#GPUS[@]}
 EFFECTIVE=$((BATCH_SIZE * NUM_GPUS * GRAD_ACCUM))
 
 echo "==============================================="
-echo " Qwen3.5-0.8B Contrastive Pretraining"
+echo " Stage 1: MMEB-Full Pretraining"
 echo "==============================================="
 echo "  GPUs:              ${CUDA_DEVICES} (${NUM_GPUS})"
 echo "  Model:             ${MODEL_PATH}"
@@ -68,9 +61,9 @@ echo "  Batch size:        ${BATCH_SIZE}/GPU x ${NUM_GPUS} GPUs x ${GRAD_ACCUM} 
 echo "  LR:                ${LR}  |  Epochs: ${EPOCHS}"
 echo "  Max pixels:        ${MAX_PIXELS}  |  MRL: ${MRL_DIMS}"
 echo "  LoRA:              rank=${LORA_RANK}, alpha=${LORA_ALPHA}"
+echo "  Data mix:          ${DATA_MIX_VERSION} (~1.07M MMEB training samples)"
 echo "  Seed:              ${SEED}"
 echo "  WandB:             ${USE_WANDB} (${WANDB_PROJECT})"
-echo "  Optimized mix:     ${USE_OPTIMIZED_MIX}  mined_dir=${MINED_DIR}"
 echo "  Gradient ckpt:     ${GRADIENT_CHECKPOINTING}"
 echo "==============================================="
 
@@ -85,17 +78,12 @@ ARGS="--model_path ${MODEL_PATH} --output_dir ${OUTPUT_DIR} \
     --save_steps ${SAVE_STEPS} --log_interval ${LOG_INTERVAL}"
 
 [ -n "${IMAGE_DIR:-}" ]    && ARGS="${ARGS} --image_dir ${IMAGE_DIR}"
-[ -n "${MEGAPAIRS_IMAGE_DIR:-}" ] && ARGS="${ARGS} --megapairs_image_dir ${MEGAPAIRS_IMAGE_DIR}"
-[ -n "${DATA_DIR:-}" ]     && ARGS="${ARGS} --data_dir ${DATA_DIR}"
-[ -n "${SUBSETS:-}" ]      && ARGS="${ARGS} --subsets ${SUBSETS}"
-[ -n "${TASK_TYPES:-}" ]   && ARGS="${ARGS} --task_types ${TASK_TYPES}"
-[ -n "${MAX_SAMPLES:-}" ]  && ARGS="${ARGS} --max_samples_per_subset ${MAX_SAMPLES}"
-[ -n "${MAX_STEPS:-}" ]    && ARGS="${ARGS} --max_steps ${MAX_STEPS}"
 [ "${USE_OPTIMIZED_MIX}" = "true" ] && ARGS="${ARGS} --use_optimized_mix --data_mix_version ${DATA_MIX_VERSION}"
-[ -n "${MINED_DIR:-}" ] && ARGS="${ARGS} --mined_dir ${MINED_DIR}"
 [ "${GRADIENT_CHECKPOINTING}" = "true" ] && ARGS="${ARGS} --gradient_checkpointing"
-[ "${COMPILE}" = "true" ] && ARGS="${ARGS} --compile"
 [ -n "${RESUME_FROM:-}" ] && ARGS="${ARGS} --resume_from ${RESUME_FROM}"
+if [ -n "${MAX_STEPS:-}" ] && [ "${MAX_STEPS}" -gt 0 ]; then
+    ARGS="${ARGS} --max_steps ${MAX_STEPS}"
+fi
 if [ "${USE_WANDB}" = "true" ]; then
     ARGS="${ARGS} --use_wandb --wandb_project ${WANDB_PROJECT}"
     [ -n "${WANDB_ENTITY:-}" ]   && ARGS="${ARGS} --wandb_entity ${WANDB_ENTITY}"

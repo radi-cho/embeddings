@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
-# Contrastive pretraining for Qwen3.5-0.8B multimodal embedding model.
-#
-# Simple DDP -- each GPU encodes batch_size items, embeddings are gathered
-# across GPUs for contrastive loss.  Effective batch = batch_size * num_gpus.
-#
-# For 8 GPUs:  128/GPU -> 1024 effective (target)
+# Stage 3: Teacher distillation training.
+# Uses pre-computed 1024-dim teacher embeddings from Qwen3-VL-Embedding-8B.
+# Combined loss: contrastive + KL-div on similarities + MSE on embeddings.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -18,22 +15,20 @@ if [[ -z "${HF_TOKEN:-}" && -f "${ROOT}/.hf_token_local" ]]; then
 fi
 
 : "${CUDA_DEVICES:=0,1,2,3,4,5,6,7}"
-: "${MODEL_PATH:=${ROOT}/models/checkpoints/Qwen3.5-0.8B}"
-: "${OUTPUT_DIR:=${ROOT}/data/outputs/stage1-expanded-lora-5k}"
+: "${MODEL_PATH:=${ROOT}/data/outputs/stage2-mmeb-full-hn/checkpoint-1500}"
+: "${OUTPUT_DIR:=${ROOT}/data/outputs/stage3-distill}"
 : "${IMAGE_DIR:=${ROOT}/datasets/mmeb_train_images/images}"
-: "${MEGAPAIRS_IMAGE_DIR:=${ROOT}/data/megapairs_images}"
-: "${DATA_DIR:=${ROOT}/data/training_data}"
-: "${MINED_DIR:=${ROOT}/data/training_data_mined}"
+: "${TEACHER_EMBED_DIR:=${ROOT}/data/teacher_embeddings}"
 
 : "${BATCH_SIZE:=32}"
 : "${GRAD_ACCUM:=1}"
 : "${EPOCHS:=1}"
-: "${MAX_STEPS:=5000}"
-: "${LR:=1e-4}"
+: "${MAX_STEPS:=0}"
+: "${LR:=5e-6}"
 : "${TEMPERATURE:=0.02}"
 : "${MAX_LENGTH:=4096}"
 : "${MAX_PIXELS:=1310720}"
-: "${TRAINING_STAGE:=1}"
+: "${TRAINING_STAGE:=3}"
 : "${MRL_DIMS:=1024,256,64}"
 : "${LORA_RANK:=32}"
 : "${LORA_ALPHA:=64}"
@@ -43,14 +38,15 @@ fi
 : "${PREFETCH_FACTOR:=4}"
 : "${SEED:=42}"
 : "${GRADIENT_CHECKPOINTING:=true}"
-: "${COMPILE:=false}"
-: "${USE_OPTIMIZED_MIX:=true}"
-: "${DATA_MIX_VERSION:=v2}"
+
+: "${DISTILL_ALPHA_CON:=0.3}"
+: "${DISTILL_ALPHA_KL:=0.5}"
+: "${DISTILL_ALPHA_MSE:=0.2}"
 
 : "${USE_WANDB:=true}"
 : "${WANDB_PROJECT:=embeddings}"
 : "${WANDB_ENTITY:=radi-and-people}"
-: "${WANDB_RUN_NAME:=stage1-expanded-lora-4096-5k-8xH100}"
+: "${WANDB_RUN_NAME:=stage3-distill-8xH100}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.7
@@ -59,18 +55,17 @@ NUM_GPUS=${#GPUS[@]}
 EFFECTIVE=$((BATCH_SIZE * NUM_GPUS * GRAD_ACCUM))
 
 echo "==============================================="
-echo " Qwen3.5-0.8B Contrastive Pretraining"
+echo " Stage 3: Teacher Distillation"
 echo "==============================================="
 echo "  GPUs:              ${CUDA_DEVICES} (${NUM_GPUS})"
 echo "  Model:             ${MODEL_PATH}"
 echo "  Output:            ${OUTPUT_DIR}"
-echo "  Batch size:        ${BATCH_SIZE}/GPU x ${NUM_GPUS} GPUs x ${GRAD_ACCUM} accum = ${EFFECTIVE} effective"
+echo "  Teacher embeds:    ${TEACHER_EMBED_DIR}"
+echo "  Batch size:        ${BATCH_SIZE}/GPU x ${NUM_GPUS} GPUs = ${EFFECTIVE} effective"
 echo "  LR:                ${LR}  |  Epochs: ${EPOCHS}"
-echo "  Max pixels:        ${MAX_PIXELS}  |  MRL: ${MRL_DIMS}"
+echo "  Loss weights:      con=${DISTILL_ALPHA_CON} kl=${DISTILL_ALPHA_KL} mse=${DISTILL_ALPHA_MSE}"
+echo "  MRL:               ${MRL_DIMS}"
 echo "  LoRA:              rank=${LORA_RANK}, alpha=${LORA_ALPHA}"
-echo "  Seed:              ${SEED}"
-echo "  WandB:             ${USE_WANDB} (${WANDB_PROJECT})"
-echo "  Optimized mix:     ${USE_OPTIMIZED_MIX}  mined_dir=${MINED_DIR}"
 echo "  Gradient ckpt:     ${GRADIENT_CHECKPOINTING}"
 echo "==============================================="
 
@@ -82,23 +77,21 @@ ARGS="--model_path ${MODEL_PATH} --output_dir ${OUTPUT_DIR} \
     --training_stage ${TRAINING_STAGE} --use_mrl --mrl_dims ${MRL_DIMS} \
     --lora_rank ${LORA_RANK} --lora_alpha ${LORA_ALPHA} \
     --num_workers ${NUM_WORKERS} --prefetch_factor ${PREFETCH_FACTOR} --seed ${SEED} \
-    --save_steps ${SAVE_STEPS} --log_interval ${LOG_INTERVAL}"
+    --save_steps ${SAVE_STEPS} --log_interval ${LOG_INTERVAL} \
+    --teacher_embed_dir ${TEACHER_EMBED_DIR} \
+    --distill_alpha_con ${DISTILL_ALPHA_CON} \
+    --distill_alpha_kl ${DISTILL_ALPHA_KL} \
+    --distill_alpha_mse ${DISTILL_ALPHA_MSE}"
 
-[ -n "${IMAGE_DIR:-}" ]    && ARGS="${ARGS} --image_dir ${IMAGE_DIR}"
-[ -n "${MEGAPAIRS_IMAGE_DIR:-}" ] && ARGS="${ARGS} --megapairs_image_dir ${MEGAPAIRS_IMAGE_DIR}"
-[ -n "${DATA_DIR:-}" ]     && ARGS="${ARGS} --data_dir ${DATA_DIR}"
-[ -n "${SUBSETS:-}" ]      && ARGS="${ARGS} --subsets ${SUBSETS}"
-[ -n "${TASK_TYPES:-}" ]   && ARGS="${ARGS} --task_types ${TASK_TYPES}"
-[ -n "${MAX_SAMPLES:-}" ]  && ARGS="${ARGS} --max_samples_per_subset ${MAX_SAMPLES}"
-[ -n "${MAX_STEPS:-}" ]    && ARGS="${ARGS} --max_steps ${MAX_STEPS}"
-[ "${USE_OPTIMIZED_MIX}" = "true" ] && ARGS="${ARGS} --use_optimized_mix --data_mix_version ${DATA_MIX_VERSION}"
-[ -n "${MINED_DIR:-}" ] && ARGS="${ARGS} --mined_dir ${MINED_DIR}"
+[ -n "${IMAGE_DIR:-}" ] && ARGS="${ARGS} --image_dir ${IMAGE_DIR}"
 [ "${GRADIENT_CHECKPOINTING}" = "true" ] && ARGS="${ARGS} --gradient_checkpointing"
-[ "${COMPILE}" = "true" ] && ARGS="${ARGS} --compile"
 [ -n "${RESUME_FROM:-}" ] && ARGS="${ARGS} --resume_from ${RESUME_FROM}"
+if [ -n "${MAX_STEPS:-}" ] && [ "${MAX_STEPS}" -gt 0 ]; then
+    ARGS="${ARGS} --max_steps ${MAX_STEPS}"
+fi
 if [ "${USE_WANDB}" = "true" ]; then
     ARGS="${ARGS} --use_wandb --wandb_project ${WANDB_PROJECT}"
-    [ -n "${WANDB_ENTITY:-}" ]   && ARGS="${ARGS} --wandb_entity ${WANDB_ENTITY}"
+    [ -n "${WANDB_ENTITY:-}" ] && ARGS="${ARGS} --wandb_entity ${WANDB_ENTITY}"
     [ -n "${WANDB_RUN_NAME:-}" ] && ARGS="${ARGS} --wandb_run_name ${WANDB_RUN_NAME}"
 fi
 

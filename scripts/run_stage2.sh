@@ -26,8 +26,8 @@ fi
 
 # ---- Paths ----
 : "${CUDA_DEVICES:=0,1,2,3,4,5,6,7}"
-: "${MODEL_PATH:=${ROOT}/data/outputs/stage1-lr1e4-a64/final}"
-: "${OUTPUT_DIR:=${ROOT}/data/outputs/stage2-k15}"
+: "${MODEL_PATH:=${ROOT}/data/outputs/stage1-mmeb-full/final}"
+: "${OUTPUT_DIR:=${ROOT}/data/outputs/stage2-mmeb-full-hn}"
 : "${IMAGE_DIR:=${ROOT}/datasets/mmeb_train_images/images}"
 : "${DATA_DIR:=${ROOT}/data/training_data}"
 : "${MINED_DIR:=${ROOT}/data/training_data_mined}"
@@ -36,7 +36,7 @@ fi
 : "${BATCH_SIZE:=32}"          # Halved from Stage 1 (K=15 HNs triple forward cost)
 : "${GRAD_ACCUM:=1}"
 : "${EPOCHS:=1}"
-: "${LR:=5e-5}"                # Lower than Stage 1 (fine-tuning from checkpoint)
+: "${LR:=1e-5}"                # Same as Stage 1 (fine-tuning from checkpoint)
 : "${TEMPERATURE:=0.02}"
 : "${MAX_LENGTH:=512}"
 : "${MAX_PIXELS:=1310720}"
@@ -56,7 +56,7 @@ fi
 : "${USE_WANDB:=true}"
 : "${WANDB_PROJECT:=embeddings}"
 : "${WANDB_ENTITY:=radi-and-people}"
-: "${WANDB_RUN_NAME:=qwen35-0.8b-stage2-k15-hardneg}"
+: "${WANDB_RUN_NAME:=stage2-mmeb-full-hn-8xH100}"
 
 # ---- Safety / perf env ----
 export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}"
