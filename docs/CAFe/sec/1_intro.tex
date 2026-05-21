@@ -1,0 +1,61 @@
+\section{Introduction}\label{sec:introduction}
+
+\begin{figure*}[t]
+\includegraphics[width=\textwidth]{fig/teaser.jpeg}
+\captionof{figure}{Capabilities of various vision-language models. While encoder-based models, e.g., CLIP, excel in generating vision-text aligned embeddings and show promising results in image-text retrieval, they fall short in producing free-form text and reasoning about retrieved images (left). Conversely, Multimodal Large Language Models (MLLMs) have shown remarkable success in multimodal understanding and generation, but their direct embeddings yield suboptimal retrieval results (middle). 
+\algname effectively bridges this gap by integrating representation learning and language generation, enabling not only retrieval but also advanced generative capabilities (right). 
+}
+\label{fig:teaser}
+\end{figure*}
+
+The rapid development of large vision-language models (LVLMs) has unlocked new capabilities in multimodal understanding, enabling models to perceive, interpret, and reason over complex information across both visual and textual inputs~\citep{du2022survey, yin2023survey, ghosh2024exploring, chen2024autoprm, zhang2024vision, chen2024mj}.
+%
+Typically, an LVLM comprises a modality-specific encoder, such as a vision transformer~\citep{dosovitskiy2020image,radford2021learning}, a pre-trained decoder-only large language model (LLM), such as LLaMA~\citep{touvron2023llama,dubey2024llama}, and a bridging projector that facilitates vision-language alignment between the encoder and the decoder.
+%
+Popular LVLMs such as LLaVA~\citep{liu2023improvedllava, liu2024visual, li2024llava}, InternVL~\citep{chen2023internvl, gao2024mini}, and BLIP~\citep{li2022blip, li2023blip} have demonstrated significant improvements in tasks such as visual question answering (VQA)~\citep{wu2017visual, de2023visual} by aligning both visual and textual modalities during generations.
+%
+
+Despite the success in generative tasks, most current LVLMs exhibit limitations in tasks that require strong representation learning, such as unimodal and cross-modal retrieval~\citep{jiang2024vlm2vec}.
+%
+These tasks demand high-quality embeddings that capture nuanced, context-rich information across modalities, which are essential for precision and robustness. 
+%
+However, this remains a challenge for decoder-only architectures designed primarily for sequential output generation, as they are inherently less suited to expressive representation generation. 
+%
+This structural limitation means that while these LVLMs perform well in generative tasks, their retrieval performance, where high-fidelity representations are critical, remains suboptimal.
+%
+
+Nonetheless, the open-world knowledge embedded within pre-trained LLMs provides a strong foundation for generating effective embeddings, especially with additional contrastive fine-tuning~\citep{behnamghader2024llm2vec, jiang2024vlm2vec}.
+%
+However, modifications such as switching causal attention to bi-directional~\citep{behnamghader2024llm2vec} limits their generative capabilities, which greatly narrows down their downstream use cases and presents a trade-off between representation learning and open-ended generation rather than a unified gain.
+%
+To this end, we propose a novel \textbf{c}ontrastive-\textbf{a}utoregressive \textbf{f}in\textbf{e}-tuning (\textbf{\algname}) framework that enhances the capabilities of LVLMs, allowing them to produce high-quality embeddings suitable for retrieval tasks without compromising generative functionality. 
+%
+By incorporating contrastive loss during fine-tuning, \algname aligns multimodal representations across text and image pairs, strengthening the model’s potential for both accurate retrieval and coherent generation. 
+%
+Through extensive experiments, we demonstrate that the proposed framework achieves state-of-the-art performance in multimodal retrieval, leveraging MLLM's advanced multimodal understanding capabilities. 
+%
+Additionally, the modality gap~\citep{liang2022mind} in 
+the multimodal representation space is removed, potentially improving cross-modal consistency and enhancing multimodal performance.
+%
+On the other hand, the model also shows strong generative abilities and robustness against object hallucinations (OH)~\citep{biten2022let,zhou2023analyzing, chen2024halc, fang2024uncertainty}, a common issue in modern LVLMs, potentially due to the incorporation of the contrastive objective, which enhances the model's ability to differentiate fine-grained details.
+
+As shown in \figref{fig:teaser}, traditional encoder-based models like CLIP~\citep{radford2021learning} and its variants such as RankCLIP~\citep{zhang2024rankclip} excel in creating aligned embeddings for image-text retrieval but lack in generative reasoning.
+%
+In contrast, our proposed \algname, depicted on the right side of \figref{fig:teaser}, successfully integrates representation learning with generative capabilities.
+%
+In other words, \algname establishes a unified framework that simultaneously supports generative and retrieval capabilities, bridging the gap between these traditionally distinct domains.
+%
+And our contributions can be summarized as follow:
+\begin{itemize}
+    \item We introduce a unified contrastive-autoregressive fine-tuning framework that enables LVLMs to excel in both retrieval and generation tasks.
+    %
+    \item Evaluated across multimodal benchmarks, the model achieves state-of-the-art (SOTA) results in multimodal retrieval, while also demonstrating strong multimodal understanding capability and robustness against object hallucinations (OH), which significantly enhances the versatility and performance of LVLMs across complex multimodal tasks.
+    %
+    \item To the best of our knowledge, \algname is the first unified contrastive-autoregressive fine-tuning framework for LVLMs,
+    % that combines seemingly separate objectives
+    providing additional insight for developing better-rounded multimodal models.
+    %
+\end{itemize}
+%
+
+

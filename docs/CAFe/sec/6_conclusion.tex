@@ -1,0 +1,12 @@
+\section{Conclusion}
+
+We introduce \algname, a contrastive-autoregressive fine-tuning framework designed to enhance MLLMs for both representation and generative tasks. Our approach adapts a pretrained MLLM to generate multimodal embeddings while maintaining its language generation capabilities by designing novel embedding instructions. We further propose to fine-tune the model by integrating a contrastive objective with autoregressive language modeling loss.
+
+We conducted extensive experiments on retrieval for both cross-modal (image-text) and multimodal tasks. Our results demonstrate significant performance improvements, particularly in multimodal retrieval tasks. This is likely due to the model's ability to leverage the strengths of LLMs in processing and understanding multimodal information, surpassing traditional multimodal fusion methods such as simple concatenation. Additionally, we also demonstrate that the proposed framework removes the modality gap in the multimodal representation space, potentially improving cross-modal consistency and enhancing multimodal performance.
+Furthermore, our proposed framework also demonstrates strong multimodal understanding capability and robustness against object hallucinations. Results on THRONE and POPE highlight the superior performance in mitigating object hallucinations. 
+%
+Overall, we present a multimodal framework that effectively and seamlessly combines representation learning and generation capabilities, providing insights for developing better-rounded multimodal models.
+%
+
+% \paragraph{Limitations and future work.}
+% This work is currently limited to processing single-image inputs only. Handling multi-image inputs or video sequences could enhance the model's utility in real-world applications, such as video summarization, multi-image storytelling, and multi-image VQA. Future research could explore extending the model to these settings by leveraging similar methodologies.

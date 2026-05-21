@@ -1,0 +1,105 @@
+\section{Method}\label{sec:method}
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{fig/pipelinev2.jpeg}
+    \caption{Pipeline of the proposed framework, \algname. It leverages a pretrained MLLM to jointly encode multimodal input and generate language responses. The model is trained using a weighted combination of contrastive loss and autoregressive language modeling loss on paired multimodal input. Specialized embedding instructions are designed to prompt the MLLM to generate effective embeddings, while language instructions are employed for language generation. The image is from MSCOCO dataset~\citep{Chen2015MicrosoftCC}. }
+    \label{fig:pipeline}
+\end{figure*}
+%
+We develop a unified framework for multimodal representation learning and natural language generation by adapting and jointly optimizing MLLM with both contrastive loss and language modeling loss. 
+%
+\figref{fig:pipeline} illustrates the pipeline of our proposed framework. 
+%
+We begin with a pretrained MLLM that processes multimodal inputs and generates language responses based on instructions. 
+%
+To enable embedding generation, we introduce an embedding instruction that mirrors the structure of language instructions, guiding the model to produce embeddings for any multimodal input. 
+%
+Fine-tuning is then conducted using paired image-text data, where the MLLM separately processes each modality to yield corresponding image and text embeddings. 
+%
+A contrastive loss is computed between these embeddings, while an autoregressive language modeling loss is applied via the language instruction of the same paired input. 
+%
+This joint fine-tuning enables the model to generate both high-quality free-form language responses and grounded robust multimodal embeddings.
+%
+
+\subsection{Multimodal embedding}\label{sec:emb_instruct}
+We employ a prompt-based representation method to enable MLLMs to generate multimodal embeddings. 
+%
+Previous research has shown that prompt-based method can effectively represent sentence embedding with LLMs~\citep{jiang2023scaling}. 
+%
+Following this observation, we specifically design an embedding instruction to encode image and/or text, as shown in \tabref{tab:prompt}.
+%
+
+Following the conventional human-assistant conversation format of MLLMs~\citep{liu2024visual}, we set the system message and incorporate the image and text data as human input. 
+%
+Specifically, \texttt{<image>} represents the image token that encodes the visual information, while \texttt{<text>} encompasses any textual data that needs to be encoded.
+%
+Both \texttt{<image>} and \texttt{<text>} can be optionally absent, allowing for flexible encoding of multimodal or unimodal inputs (i.e., text-only or image-only). 
+%
+The generated assistant answer serves as the output, from which we extract the multimodal embedding by taking the last layer hidden states of the last token. 
+%
+Although the last token inherently captures all preceding information due to causal self-attention, following~\citet{jiang2023scaling}, we explicitly impose a one-word limitation, to enhance representation capabilities. 
+%
+Specifically, we use a \texttt{\{Embedding prompt\}} of ``\texttt{Compress this image/sentence in one word:}" for prompting the MLLM to generate embeddings of the multimodal input.
+%
+\begin{table}[t]
+\centering
+\begin{tcolorbox}[colback=yellow!20, colframe=black, arc=2mm]
+\begin{verbatim}
+System message
+Human: <image> 
+       <text>
+       {Embedding prompt} 
+Assistant: 
+\end{verbatim}
+\end{tcolorbox}
+\caption{The embedding instruction used to generate multimodal embeddings with MLLMs. \texttt{<image>} and \texttt{<text>} represents the image token and text input, respectively. \texttt{\{Embedding prompt\}} is the prompt used for instructing the MLLM to generate the multimodal embedding. }
+\label{tab:prompt}
+\vspace{-0.2in}
+\end{table}
+%
+
+\subsection{Contrastive-Autoregressive Joint Training}
+We train the adapted MLLM jointly with a contrastive objective and autoregressive language modeling. 
+%
+Building on existing MLLM that has been pre-trained and instruction-tuned with autoregressive language modeling, we continue to fine-tune it using multimodal pairs for contrastive learning, while also maintaining its language generation capabilities through the autoregressive objective.
+%
+
+\paragraph{Contrastive learning.}
+We employ the standard InfoNCE loss for contrastive learning, which encourages the model to learn discriminative representations that are close to positive samples and far from negative samples. 
+%
+The contrastive learning objective can be formulated as:
+%
+\begin{equation}
+\begin{split}
+    \mathcal{L}_{\text{con}} = - \frac{1}{N} (
+    \sum_{i=1}^{N} \log \frac{\exp(\mathbf{h}_i^{v\intercal} \cdot \mathbf{h}_i^t / \tau)}{\sum_{j=1}^{N} \exp(\mathbf{h}_i^{v\intercal} \cdot \mathbf{h}_j^t / \tau)} \\ 
+    + \sum_{i=1}^{N} \log \frac{\exp(\mathbf{h}_i^{t\intercal} \cdot \mathbf{h}_i^v / \tau)}{\sum_{j=1}^{N} \exp(\mathbf{h}_i^{t\intercal} \cdot \mathbf{h}_j^v / \tau)} 
+    )
+\end{split}
+\label{eq:con}
+\end{equation}
+%
+where $\mathbf{h_i^v}$ and $\mathbf{h_i^t}$ are the normalized embeddings of the $i$th visual-text pair, $N$ is the batch size, and $\tau$ is the temperature parameter that scale the logits. 
+%
+
+\paragraph{Autoregressive language modeling.} 
+Following the standard approach described in~\citep{radford2018improving}, we train the model to predict the next token based on the context provided by the previous tokens. 
+%
+The autoregressive language modeling objective can be formulated as:
+%
+\begin{equation}
+\mathcal{L}_{\text{lm}} = - \sum_{t=1}^{T} \log p(y_t | y_{<t})
+\end{equation}
+%
+where $y_t$ is the target token at position t, and $p(y_t | y_{<t})$ is the predicted probability distribution over the vocabulary.
+%
+
+\paragraph{Contrastive-autoregressive modeling.} 
+The overall objective function combines the autoregressive language modeling and contrastive learning objectives:
+%
+\begin{equation}
+\mathcal{L} = \alpha_{\text{lm}} \mathcal{L}_{\text{lm}} + \alpha_{\text{con}} \mathcal{L}_{\text{con}} \label{eq:comb_loss}
+\end{equation}
+%
+where $\alpha_{\text{lm}}$ and $\alpha_{\text{con}}$ are scaling parameters.
+%

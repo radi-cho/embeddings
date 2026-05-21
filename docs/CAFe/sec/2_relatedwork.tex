@@ -1,0 +1,52 @@
+\section{Related Work}\label{sec:related_work}
+
+\subsection{Multimodal Large Language Models}
+Recent advances in multimodal large language models (MLLMs) have led to the development of models that can receive, reason, and output with multimodal information. 
+%
+Notable examples include BLIP-2~\citep{li2023blip}, Flamingo~\citep{alayrac2022flamingo}, and LLaVA~\citep{liu2024visual}, which integrate additional encoders into textual LLMs to process inputs from other modalities. 
+%
+A typical MLLM architecture consists of an LLM, a modality encoder, and a projector that connects them. 
+%
+For example, LLaVA~\citep{liu2024visual} leverages a pretrained LLM and a pretrained vision encoder, followed by a two-stage training process. 
+%
+In the first stage, the model aligns text and image inputs using image-text pairs, training only the projector between the LLM and the modality encoder. 
+%
+The second stage involves fine-tuning the model on a visual instruction tuning dataset for improved instruction following ability.
+%
+
+State-of-the-art MLLMs have demonstrated excellent performance in various vision scenarios, including single-image~\citep{dai2023instructblip,zhu2023minigpt,zhang2024llamaadapter}, multi-image~\citep{jiang2405mantis,li2023empowering,li2023fine}, and video settings~\citep{li2025llama,lin2023video, zhang2024beyond}. 
+%
+Furthermore, models like LLaVA-OneVision~\citep{li2024llava} have achieved state-of-the-art results across a broad range of tasks and in all three vision scenarios~\citep{li2024llavanext,zhang2024internlm}. 
+%
+Despite these success, the use of MLLMs for enhancing text and image understanding in multimodal representations remains relatively under-explored. 
+%
+% \zz{Add how our approach improves upon these pre-trained MLLMs}
+To address this gap, we leverage a MLLM for unified representation learning and language generation by introducing a contrastive-autoregressive fine-tuning framework.
+
+
+\subsection{Vision-language Representation Learning}
+Recent vision-language models (VLMs) have achieved remarkable success by pretraining on large-scale image-text pairs, yielding strong visual and textual representations that enable zero-shot adaptation to tasks such as image classification and cross-modal retrieval~\citep{zhang2024rankclip, zhang2024vision, ghosh2024exploring}. 
+%
+One of the pioneering works in this area is Contrastive Language-Image Pretraining (CLIP)~\citep{radford2021learning}, which introduced a dual-encoder architecture pretrained with contrastive objectives on noisy image-text pairs. 
+%
+Subsequent works have built upon its foundation by refining data strategies or proposing alternative learning objectives~\citep{li2022blip,zhai2023sigmoid,li2023blip,cherti2023reproducible, zhao2024multimodal, zhang2024rankclip}. 
+
+One line of research combines contrastive learning with language modeling~\citep{yu2022coca, li2023blip}. 
+%
+For example, CoCa~\citep{yu2022coca} trains an image-text encoder-decoder model jointly with contrastive loss and captioning loss. 
+%
+BLIP~\citep{li2023blip} optimizes a combination of understanding-based and generation-based objectives during pretraining. 
+%
+These methods have achieved promising performance and demonstrated flexible transferability to both vision-language understanding and generation tasks.
+%
+
+With the advancement of MLLMs, recent studies have explored their application in multimodal representation learning~\citep{zhang2024notellm,jiang2024e5,jiang2024vlm2vec}.
+%
+For example, NoteLLM-2~\citep{zhang2024notellm} leverages MLLMs to enhance multimodal representations for item-to-item (I2I) recommendations. 
+%
+Concurrently with our work, VLM2VEC~\citep{jiang2024vlm2vec} presents a multimodal embedding benchmark and adapts an MLLM for contrastive representation learning. 
+%
+However, they have not investigated how this adaptation affects the language generation capabilities of MLLMs. 
+%
+Our work addresses this gap by jointly modeling both embedding and language generation tasks based on a state-of-the-art MLLM.
+%

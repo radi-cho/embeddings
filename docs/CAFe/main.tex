@@ -1,0 +1,77 @@
+\documentclass[]{fairmeta}
+
+% Import additional packages in the preamble file, before hyperref
+\input{preamble}
+\usepackage{tcolorbox}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{xspace}
+
+%%%%%%%%% TITLE - PLEASE UPDATE
+\title{\algname: Unifying Representation and Generation with Contrastive-Autoregressive Finetuning}
+
+%%%%%%%%% AUTHORS - PLEASE UPDATE
+\author[1,2,\dagger]{Hao Yu}
+\author[1]{Zhuokai Zhao}
+\author[1]{Shen Yan}
+\author[1]{Lukasz Korycki}
+\author[1]{Jianyu Wang}
+\author[1]{Baosheng He}
+\author[1]{Jiayi Liu}
+\author[1]{Lizhu Zhang}
+\author[1]{Xiangjun Fan}
+\author[1]{Hanchao Yu}
+
+\affiliation[1]{Meta}
+\affiliation[2]{Boston University}
+\contribution[\dagger]{Work done during an internship at Meta.}
+
+\abstract{
+The rapid advancement of large vision-language models (LVLMs) has driven significant progress in multimodal tasks, enabling models to interpret, reason, and generate outputs across both visual and textual domains. 
+%
+While excelling in generative tasks, existing LVLMs often face limitations in tasks requiring high-fidelity representation learning, such as generating image or text embeddings for retrieval. 
+%
+Recent work has proposed finetuning LVLMs for representational learning, but the finetuned model often loses its generative capabilities due to the representational learning training paradigm.
+%
+To address this trade-off, we introduce \textbf{\algname}, a \textbf{c}ontrastive-\textbf{a}utoregressive \textbf{f}in\textbf{e}-tuning framework that enhances LVLMs for both representation and generative tasks.
+%
+By integrating a contrastive objective with autoregressive language modeling, our approach unifies these traditionally separate tasks, achieving state-of-the-art results in both multimodal retrieval and multimodal generative benchmarks, including
+%  visual question answering (VQA) and 
+object hallucination (OH) mitigation. 
+%
+% To the best of our knowledge, 
+\algname establishes a novel
+% the first 
+framework that synergizes embedding and generative functionalities in a single model, setting a foundation for future multimodal models that excel in both retrieval precision and coherent output generation.
+%
+}
+
+\date{\today}
+\correspondence{Hanchao Yu at \email{hanchaoyu@meta.com}}
+
+% You can add additional metadata fields as follows 
+\metadata[Code]{\url{https://github.com/haoyu-bu/CAFe}}
+\metadata[Project Page]{\url{https://haoyu-bu.github.io/CAFeUnify/}}
+
+\begin{document}
+
+\maketitle
+
+\input{sec/1_intro}
+\input{sec/2_relatedwork}
+\input{sec/3_method}
+\input{sec/4_experiments}
+\input{sec/5_ablation_analysis}
+\input{sec/6_conclusion}
+
+\clearpage
+\newpage
+\bibliographystyle{assets/plainnat}
+\bibliography{main}
+
+\clearpage
+\newpage
+\beginappendix
+\input{sec/X_appendix}
+
+\end{document}

@@ -1,0 +1,319 @@
+\section{Experiments}\label{sec:experiments}
+\subsection{Training Setups}
+\paragraph{Base models.}
+We adopt LLaVa-OneVision~\citep{li2024llava} as the backbone MLLM for our joint contrastive-autoregressive training framework, given its state-of-the-art performance across various multimodal understanding tasks. 
+%
+However, note that our proposed \algname is model-agnostic, which is not limited to the choice of base model.
+%
+
+\paragraph{Datasets.}
+LLaVa-OneVision~\citep{li2024llava} has been trained on a comprehensive and diverse instruction dataset that includes an important subset of detailed description data. 
+%
+This subset is particularly well-suited for contrastive learning, offering high-quality image-text pairs.
+%
+Specifically, we utilize subsets such as ShareGPT4V~\citep{chen2023sharegpt4v}, ShareGPT4o~\citep{sharegpt4o}, and Image Textualization~\citep{pi2024image}, comprising a total of 248K samples. 
+%
+
+One objective of this strategy is to demonstrate that, without introducing new data, MLLMs can generate high-quality vision-text embeddings by simply re-training on the existing dataset. 
+%
+And to adapt the instruction tuning data for contrastive learning, we modify the original samples by discarding their instructions and using the corresponding images as visual inputs.
+%
+The associated answers are then repurposed as captions to create image-text pairs.
+%
+
+\vspace{0.1cm}
+\noindent\textbf{Implementation details.}
+We fine-tune the pre-trained 0.5B and 7B single-image LLaVa-OneVision~\citep{li2024llava} models using a global batch size of 1024 and the combined contrastive and language modeling loss, as shown in \eqnref{eq:comb_loss}, for one epoch. 
+%
+To ensure that the contrastive loss and the language modeling loss are on a comparable scale, we set $\alpha_{\text{con}}$ to 10.0 and $\alpha_{\text{lm}}$ to 1.0 by default. 
+%
+Learning rates are set to $2\times10^{-6}$ for the vision encoder and $1\times10^{-5}$ for the projector and LLM. 
+%
+Other training configurations follow those of LLaVa-OneVision~\citep{li2024llava}. 
+%
+All experiments are conducted on 256 A100 GPUs.
+%
+
+\vspace{0.1cm}
+\noindent\textbf{Evaluation strategies.}
+We evaluate the model fine-tuned by \algname on both multimodal representation tasks and multimodal understanding tasks. 
+%
+The versatility of our framework allows it to seamlessly adapt to various representation and generation tasks without requiring additional fine-tuning or adaptation. 
+%
+Specifically, we present the results of our experiments on zero-shot image-text retrieval (\secref{subsec:img_text_retrieval}), multimodal retrieval (\secref{subsec:multimodal_retrieval}), multimodal understanding (\secref{subsec:multimodal_understanding}), and object hallucination reduction (\secref{subsec:oh_reduction}). 
+%
+
+% \subsection{Zero-Shot Classification}\label{subsec:zs_classification}
+
+\subsection{Zero-Shot Cross-modal Retrieval}\label{subsec:img_text_retrieval}
+%
+\begin{table*}[t]
+\centering
+\caption{
+    Zero-shot image-text retrieval results on MSCOCO (5K test set)~\citep{Chen2015MicrosoftCC} and Flickr30K (1K test set)~\citep{flickrentitiesijcv} datasets. 
+    %
+    Bold and underline indicate the first and second-best performance.
+    %
+}
+\setlength{\tabcolsep}{4pt}
+% \renewcommand{\arraystretch}{1.1}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{lp{0.7cm}p{0.7cm}p{0.7cm}p{0.7cm}p{0.7cm}p{0.7cm}p{0.7cm}p{0.7cm}p{0.7cm}p{0.7cm}p{0.7cm}p{0.7cm}}
+\toprule
+& \multicolumn{6}{c}{Image $\rightarrow$ Text Retrieval} & \multicolumn{6}{c}{Text $\rightarrow$ Image Retrieval} \\
+& \multicolumn{3}{c}{Flickr30K} & \multicolumn{3}{c}{MSCOCO} & \multicolumn{3}{c}{Flickr30K} & \multicolumn{3}{c}{MSCOCO} \\
+&  R@1 & R@5 & R@10 & R@1 & R@5 & R@10 & R@1 & R@5 & R@10 & R@1 & R@5 & R@10 \\ 
+\midrule
+CLIP~\citep{radford2021learning}     & \textbf{88.0} & \textbf{98.7} & \textbf{99.4} & \underline{58.4} & \underline{81.5} & 88.1 & \underline{68.7} & \underline{90.6} & \underline{95.2} & 37.8 & 62.4 & 72.2 \\
+VLM2VEC~\citep{jiang2024vlm2vec}     & 84.3 & 96.6 & 98.8 & 58.2 & 81.4 & \underline{88.9} & 66.7 & 88.8 & 93.9 & \underline{38.8} & \underline{66.7} & \underline{77.5} \\
+LLaVA-OV-SI-0.5B~\citep{li2024llava} & 50.6 & 77.5 & 85.7 & 25.1 & 49.0 & 60.8 & 39.4 & 67.9 & 78.0 & 20.7 & 42.6 & 54.1 \\
+LLaVA-OV-SI-7B~\citep{li2024llava} & 31.4 &	59.2 &	71.3 &	14.5 &	33.5 &	44.6 &	46.3 &	72.9 &	80.6 &	18.2 &	38.5 &	48.9\\
+\midrule
+% 0.5B, CON & 82.7 & 95.1 & 97.9 & 58.3 & 82.5 & 89.3 & 66.1 & 88.8 & 93.4 & 39.5 & 66.3 & 76.0 \\
+\algname-0.5B & 80.5 & 95.3 & 97.6 & 57.2 & 81.3 & 88.5 & 66.1 & 89.2 & 93.3 & 39.2 & 66.2 & 76.1 \\
+% 7B, CON & 89.0 & 98.2 & 99.1 & 67.0 & 86.9 & 92.5 & 75.0 & 92.9 & 96.0 & 49.6 & 74.6 & 83.1 \\
+\algname-7B & \underline{87.5} & \underline{98.2} & \underline{99.2} & \textbf{64.6} & \textbf{85.9} & \textbf{91.8} & \textbf{75.3} & \textbf{92.6} & \textbf{96.0} & \textbf{47.9} & \textbf{73.7} & \textbf{82.4} \\
+\bottomrule
+\end{tabular}
+}
+\label{tab:zero_ret}
+\end{table*}
+%
+Model finetuned by \algname can be directly applied to image-text retrieval tasks, as it can generate aligned image and text unimodal embeddings. 
+%
+To evaluate its performance, we conduct experiments on two standard image-text retrieval benchmarks: MSCOCO (5K test set)~\citep{Chen2015MicrosoftCC} and Flickr30K (1K test set)~\citep{flickrentitiesijcv} in the zero-shot setting. 
+%
+In this setting, all parameters are frozen and the model is directly used to extract embeddings without any fine-tuning. 
+%
+Following the CLIP~\citep{radford2021learning}, we first generate embeddings for each image and text sample independently for all image-text pairs in the test set. 
+%
+We then compute cosine similarity scores between these embeddings and use them to retrieve relevant image-text pairs from the entire test set. 
+%
+We report the recall for the top 1, top 5, and top 10 retrieved candidates for both image to text retrieval and text to image retrieval in \tabref{tab:zero_ret}. 
+%
+
+We compare model finetuned by \algname with several strong baselines. 
+%
+VLM2VEC~\citep{jiang2024vlm2vec} is the state-of-the-art model that also adapts a MLLM for multimodal embeddings. 
+%
+We take their model checkpoint released on HuggingFace\footnote{https://huggingface.co/TIGER-Lab/VLM2Vec-LoRA}. 
+%
+LLaVa-OneVision~\citep{li2024llava} is the MLLM that our model builds on and we report results for both 0.5B and 7B model (LLaVA-OV-SI-0.5B and LLaVA-OV-SI-7B). 
+%
+We use the same embedding instruction as described in \secref{sec:emb_instruct} and directly extract the last layer hidden states of the last token as the image and text embeddings. 
+%
+This baseline shows the zero-shot embedding capabilities of a MLLM that has not been finetuned using our approach. 
+%
+Last but not least, we include CLIP~\citep{radford2021learning}, which is a pioneering vision-language foundation model that achieves impressive zero-shot performance on image-text retrieval, as our baseline as well. 
+%
+
+
+Results in \tabref{tab:zero_ret} show that by finetuning LLaVa-OneVision model using the proposed contrastive-autoregressive loss, our \algname-7B model outperforms all the baselines. 
+%
+The 0.5B model, which is much smaller, also exhibits strong performance. 
+%
+Note that the original zero-shot LLaVA-OV-SI-0.5B shows relatively worse performance, indicating that MLLM embeddings are not ideal for representation learning and require contrastive fine-tuning to achieve optimal results. 
+%
+Additionally, the performance of the 7B model LLaVA-OV-SI-7B does not surpass that of the 0.5B model LLaVA-OV-SI-0.5B, which may be due to the model not being optimized for effective representation, indicating that a larger MLLM does not necessarily lead to enhanced representation capabilities.
+%
+
+\subsection{Multimodal Retrieval}\label{subsec:multimodal_retrieval}
+%
+\begin{table*}[t]
+\centering
+\caption{Multimodal retrieval results on the Multimodal Embedding Benchmark (MMEB), with scores averaged across each meta-task, as well as average scores for in-distribution datasets (IND), out-of-distribution datasets (OOD) and all datasets (Overall).}
+\setlength{\tabcolsep}{6pt}
+% \renewcommand{\arraystretch}{1.1}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{cccccccc}
+\toprule
+Model & Classification & VQA & Retrieval & Grounding & IND & OOD & Overall \\
+\midrule
+CLIP~\citep{radford2021learning} & 42.8 & 9.1 & 53.0 & 51.8 & 37.1 & 38.7 & 37.8 \\
+BLIP2~\citep{li2023blip} & 27.0 & 4.2 & 33.9 & 47.0 & 25.3 & 25.1 & 25.2\\
+SigLIP~\citep{zhai2023sigmoid} & 40.3 & 8.4 & 31.6 & 59.5 & 32.3 & 38.0 & 34.8\\
+OpenCLIP~\citep{cherti2023reproducible} & 47.8 & 10.9 & 52.3 & 53.3 & 39.3 & 40.2 & 39.7\\
+UniIR~\citep{wei2023uniir} & 42.1 & 15.0 & 60.1 & 62.2 & 44.7 & 40.4 & 42.8\\
+E5-V~\citep{jiang2024e5} & 21.8 & 4.9 & 11.5 & 19.0 & 14.9 & 11.5 & 13.3 \\
+Magiclens~\citep{zhang2024magiclens} & 38.8 & 8.3 & 35.4 & 26.0 & 31.0 & 23.7 & 27.8\\
+VLM2VEC~\citep{jiang2024vlm2vec} & 54.8 & \underline{54.9} & \underline{62.3} & 79.5 & \underline{66.5} & 52.0 & \underline{60.1}\\
+LLaVA-OV-SI-7B~\citep{li2024llava} & 19.8 & 6.9 & 17.3 & 16.0 & 17.0 & 12.4 & 14.9 \\
+\midrule
+\algname-0.5B & \underline{59.1} & 49.1 & 61.0 & \underline{83.0} & 64.3 & \underline{53.7} & 59.6 \\
+\algname-7B & \textbf{65.2} & \textbf{65.6} & \textbf{70.0} & \textbf{91.2} & \textbf{75.8} & \textbf{62.4} & \textbf{69.8} \\
+\bottomrule
+\end{tabular}
+}
+\label{tab:vlm}
+\end{table*}
+%
+Multimodal retrieval involves queries and targets that include interleaved text and images. 
+%
+It is more challenging than the traditional text-image retrieval tasks, as the model needs to not only understand the individual modalities but also capture their complex relationships and interplay. 
+%
+Traditional methods~\citep{radford2021learning,li2023blip,zhai2023sigmoid,cherti2023reproducible} often fall short by either processing text and images separately or performing shallow fusion of visual and textual information. 
+%
+In contrast, MLLMs offer an ideal solution, leveraging the multimodal reasoning and understanding abilities of LLMs to effectively integrate and process multiple modalities.
+%
+We evaluate our model on Massive Multimodal Embedding Benchmark (MMEB)~\citep{jiang2024vlm2vec}, which includes 36 datasets spanning four meta-task categories: classification, visual question answering, retrieval, and visual grounding. 
+%
+For fair comparison, we finetuned our model on the training sets of MMEB using contrastive loss only for 600 steps. 
+%
+Results on the validation set of MMEB are reported in \tabref{tab:vlm}. 
+%
+Following~\cite{jiang2024vlm2vec}, Precision@1 scores are averaged for each meta-task and we also provide an average score for in-distribution datasets (IND), out-of-distribution datasets (OOD), as well as an overall average score across all datasets. 
+%
+
+For comparison, we include several baselines that directly apply vision/text encoders (CLIP~\citep{radford2021learning}, BLIP2~\citep{li2023blip}, SigLIP~\citep{zhai2023sigmoid}, OpenCLIP~\citep{cherti2023reproducible}) and combine multimodal features using score-level fusion by element-wise addition with equal weights following~\cite{jiang2024vlm2vec}. 
+%
+We also include UniIR~\citep{wei2023uniir}, which builds on CLIP and BLIP, employing shallow fusion techniques such as score-level and feature-level fusion to integrate modalities. 
+%
+MagicLens~\citep{zhang2024magiclens} uses a multi-head attention pooler to unify multimodal inputs into a single embedding. 
+%
+E5-V~\citep{jiang2024e5} leverages vision-language models for multimodal embedding tasks and is trained exclusively on text pairs. 
+%
+VLM2REC~\citep{jiang2024vlm2vec} is the current state-of-the-art model on this benchmark, which also leverages vision-language models for multimodal embedding tasks. 
+%
+Additionally, we include LLaVA-OV-SI-7B~\citep{li2024llava}, which extracts embeddings from LLaVA-OV-SI-7B directly, demonstrating the zero-shot embedding capabilities of an MLLM that has not been fine-tuned with contrastive loss, similar to the one we have in cross-modal retrieval (\secref{subsec:img_text_retrieval}).
+%
+
+The results in \tabref{tab:vlm} demonstrate that our method significantly outperforms all baselines and the previous state-of-the-art by a large margin. 
+%
+Notably, our 0.5B model, which is 8 times smaller than VLM2REC~\citep{jiang2024vlm2vec}, achieves comparable performance. 
+%
+Our 7B model improves upon the previous state-of-the-art by a 10.2 percentage points in overall score, indicating the effectiveness of \algname.
+%
+
+\subsection{Multimodal Understanding}\label{subsec:multimodal_understanding}
+
+\begin{table}[t]
+\centering
+\caption{
+    Results on MMMU and MMStar. 
+    %
+    \algname performs comparably with LLaVA-OV~\citep{li2024llava} on multimodal understanding.
+    %    
+}
+% \setlength{\tabcolsep}{12pt}
+% \renewcommand{\arraystretch}{1.1}
+% \resizebox{\linewidth}{!}{
+\begin{tabular}{lccc}
+\toprule
+Model & MMMU & MMStar\\
+\midrule
+LLaVA-OV-SI-0.5B~\citep{li2024llava} & 31.2 & 36.3 \\
+\algname-0.5B & 31.0 & 39.1 \\
+\midrule
+LLaVA-OV-SI-7B~\citep{li2024llava} & 47.3 & 60.9 \\
+\algname-7B & 47.0 & 56.8 \\
+\bottomrule
+\end{tabular}
+% }
+\label{tab:understanding}
+\end{table}
+% \begin{table*}[h]
+%     \centering
+%     \caption{
+%     {Results on multimodal understanding across 8 benchmarks. We report the val/test set scores for DocVQA and InfoVQA. For MME, we report cognition/perception scores. \algname consistently shows performance comparable to the SOTA MLLM, LLaVA-OV~\citep{li2024llava}.}
+%     }
+%     \setlength{\tabcolsep}{2pt} 
+%     % \renewcommand{\arraystretch}{1} 
+%     \resizebox{\linewidth}{!}{ 
+%     \begin{tabular}{lcccccccc}
+%         \toprule
+%         Model  & MMMU & MMStar & ChartQA & AI2D & DocVQA & InfoVQA & MME & SeedBench \\
+%         \midrule
+%         LLaVA-OV-SI-0.5B~\citep{li2024llava} & \textbf{31.2} & 36.3  & \textbf{61.0} & 54.2 & \textbf{75.0}/\textbf{71.2} & \textbf{44.8}/\textbf{41.3}  & \textbf{272}/\textbf{1217} & 63.4\\
+%         \algname-0.5B  & 31.0 & \textbf{39.1} & 59.0 & \textbf{54.6} & 68.2/68.4 & 36.8/38.9 &  216/844 & \textbf{63.9} \\
+%         \midrule
+%         LLaVA-OV-SI-7B~\citep{li2024llava} & 47.3 & 60.9  & 78.8 & \textbf{81.6} & \textbf{89.3}/86.9 & \textbf{69.9}/65.3 &  \textbf{483}/1626 & 74.8\\
+%         \algname-7B  & \textbf{47.0} & \textbf{56.8} & \textbf{79.8} & 81.1 & 87.8/\textbf{88.5} & 67.8/\textbf{66.7}  &  424/\textbf{1684} & \textbf{76.0} \\
+%         \bottomrule
+%     \end{tabular}
+%     }
+%     \label{tab:understanding}
+% \end{table*}
+
+We also evaluate our method on multimodal understanding and reasoning in zero-shot manner, focusing on widely-adopted benchmarks including 
+% {MMMU~\citep{yue2024mmmu}, MMStar~\citep{chen2024we}, ChartQA~\citep{masry-etal-2022-chartqa}, AI2D~\citep{kembhavi2016diagram}, DocVQA~\citep{mathew2021docvqa}, InfoVQA~\citep{mathew2022infographicvqa}, MME~\citep{Fu2023MMEAC},
+% RealWorldQA~\citep{xai2024grok15v},
+% and SeedBench~\citep{li2024seed}.}
+MMMU~\citep{yue2024mmmu} and MMStar~\citep{chen2024we}.
+% , and MM-LiveBench~\citep{zhang2024lmms}. 
+MMMU~\citep{yue2024mmmu} is a benchmark that includes 11.5K meticulously collected multimodal, multi-discipline questions from college exams, quizzes, and textbooks, requiring college-level subject knowledge and deliberate reasoning. MMStar~\citep{chen2024we} comprises 1,500 multimodal, multi-discipline questions meticulously selected by humans for visual dependency and minimal data leakage, demanding advanced multimodal capabilities. 
+% MM-LiveBench~\citep{zhang2024lmms} is a benchmark designed for real-world internet content with constantly updated material. 
+%
+We compare against the original LLaVa-OneVision~\citep{li2024llava} to assess the impact of contrastive-autoregressive fine-tuning on the multimodal understanding capabilities of the MLLM. Overall, we observe comparable performance to the state-of-the-art MLLM, LLaVa-OneVision on these datasets. 
+% However, there is a performance drop on MM-LiveBench, potentially due to fine-tuning the model on image-caption data, which may affect its ability to handle more complex, real-world free-form scenarios.
+
+
+\subsection{Object Hallucination Reduction}\label{subsec:oh_reduction}
+
+\begin{table*}[t]
+\centering
+\caption{
+    THRONE Results on MSCOCO validation set. Class-wise and overall scores are reported. 
+    %
+    \algname outperforms baselines and achieves state-of-the-art performance on mitigating object hallucinations.
+    %
+}
+% \setlength{\tabcolsep}{4pt}
+% \renewcommand{\arraystretch}{1.1}
+\resizebox{\linewidth}{!}{
+\begin{tabular}{ccccccccccc}
+\toprule
+Model & $P_{ALL}$ & $R_{ALL}$ & $F^1_{ALL}$ & $F^{0.5}_{ALL}$ & $P_{CLS}$ & $R_{CLS}$ & $F^1_{CLS}$ & $F^{0.5}_{CLS}$ \\
+\midrule
+Adapter-v2~\citep{gao2023llama} & 63.6 & 73.3 & 68.1 & 65.3 & 68.2 & 70.6 & 69.4 & 68.7 \\
+Adapter-v2.1~\citep{gao2023llama} & 63.8 & 73.7 & 68.4 & 65.5 & 67.4 & 71.2 & 69.3 & 68.1 \\
+InstructBLIP~\citep{dai2023instructblip} & 70.8 & 74.3 & 72.5 & 71.5 & 77.2 & 71.9 & 74.5 & 76.1 \\
+Otter-Image~\citep{li2023otter} & 33.0 & 31.2 & 32.1 & 32.7 & 25.2 & 16.9 & 20.2 & 22.9 \\
+MiniGPT4~\citep{zhu2023minigpt} & 81.7 & 59.8 & 69.0 & 76.1 & 79.9 & 61.8 & 69.7 & 75.5 \\
+MiniGPT-v2~\citep{chen2023minigpt} & 79.0 & 66.6 & 72.3 & 76.2 & 77.6 & 67.0 & 71.9 & 75.2 \\
+mPLUG-Owl~\citep{ye2023mplug}  & 55.5 & 71.9 & 62.6 & 58.1 & 66.3 & 68.3 & 67.3 & 66.7 \\
+LRV-Instruction-v2~\citep{liu2023aligning} & 82.0 & 56.7 & 67.0 & 75.3 & 78.4 & 58.8 & 67.2 & 73.5 \\
+LLaVA-v1.3~\citep{liu2024visual} & 80.5 & 65.2 & 72.1 & 76.9 & 79.9 & 65.3 & 71.9 & 76.5 \\
+LLaVA-v1.5~\citep{liu2024improved} & 68.1 & 61.0 & 64.4 & 66.6 & 69.9 & 56.4 & 62.5 & 66.8 \\
+LLaVA-Mistral~\citep{jiang2023mistral,liu2024llava} & 86.8 & 71.8 & 78.3 & 83.6 & 84.4 & 64.2 & 70.8 & 77.5 \\
+LLaVA-OV-SI-7B~\citep{li2024llava}& 86.8 & \textbf{81.8} & 85.0 & 87.3 & 86.9 & 77.1 & 79.6 & 83.3 \\
+\midrule
+\algname & \textbf{87.0} & 81.5 & \textbf{86.3} & \textbf{88.6} & \textbf{88.1} & \textbf{78.2} & \textbf{81.2} & \textbf{84.8} \\
+\bottomrule
+\end{tabular}
+}
+\label{tab:throne_coco}
+\end{table*}
+
+\begin{table}[t]
+\centering
+\caption{POPO results on MSCOCO validation set. Yes denotes
+the proportion of answering “Yes” to the given question. \algname achieves the highest F1 score and accuracy.}
+\setlength{\tabcolsep}{3pt}
+% \renewcommand{\arraystretch}{1.1}
+% \resizebox{\linewidth}{!}{
+\begin{tabular}{cccc|c|c}
+\toprule
+Model & Acc. & Prec. & Recall & F1 & Yes (\%) \\
+\midrule
+mPLUG-Owl~\citep{ye2023mplug} & 51.5 & 50.8 & 99.4 & 67.2 & 97.8 \\
+LLaVA~\citep{liu2024visual} & 52.5 & 51.3 & 99.8 & 67.8 & 97.3 \\
+MultiModal-GPT~\citep{gong2023multimodal} & 50.0 & 50.0 & \textbf{100.0} & 66.7 & 100.0 \\
+MiniGPT-4~\citep{zhu2023minigpt} & 70.9 & 67.4 & 82.8 & 74.1 & 61.9 \\
+InstructBLIP~\citep{dai2023instructblip} & 81.5 & 75.9 & 93.7 & 83.7 & 62.2 \\
+LLaVA-OV-SI-7B~\citep{li2024llava} & 89.0 & \textbf{95.9} & 81.4 & 88.1 & 42.4 \\
+\midrule
+\algname & \textbf{89.1} & 91.0 & 87.0 & \textbf{88.9} & 47.9 \\
+\bottomrule
+\end{tabular}
+% }
+% \vspace*{-\baselineskip}
+\label{tab:pope}
+\end{table}
+
+Hallucination in LLMs and MLLMs has recently attracted significant research attention~\citep{ye2023cognitive,zhang2023siren,biten2022let,zhou2023analyzing, chen2024halc, fang2024uncertainty}. MLLMs have been shown to generate text that contradicts the visual or textual input, specifically by producing nonexistent objects in images (object hallucination)~\citep{biten2022let,zhou2023analyzing}. Such hallucinations can degrade model performance and severely impact user experience in real-world applications. Consequently, we also evaluate our model's performance on object hallucinations with THONE~\citep{kaul2024throne} and POPE~\citep{li2023evaluating}. 
+
+\noindent\textbf{Results on THRONE.} THONE employs language models to assess object hallucinations in free-form, open-ended image descriptions with respect to a predefined vocabulary of objects of interest. It utilizes the validation set of COCO 2017~\citep{Chen2015MicrosoftCC}, which comprises 5,000 images and 80 annotated object categories, prompting MLLMs to generate descriptive responses for each image. Subsequently, FLAN-T5 models~\citep{longpre2023flan} are used to evaluate whether the MLLMs produce descriptions containing nonexistent objects. 
+
+Results are presented in \tabref{tab:throne_coco}, where popular MLLMs with $\sim$7B parameters are compared. Overall and class-wise precision, recall, F0.5-score, F1-score are reported and following~\cite{kaul2024throne} classwise F0.5-score is considered the principal metric for evaluating model performance. As shown in \tabref{tab:throne_coco}, while LLaVA-OV-SI-7B~\citep{li2024llava} achieves the best performance among all the MLLMs listed, our proposed method with contrastive and autoregressive finetuning improves further upon LLaVA-OV-SI-7B for 1.5 pp of classwise F0.5-score. The performance gain could be likely due to the contrastive training from which the model learns to align representations of images and text. By learning to distinguish between matched and mismatched pairs, the model could potentially develop a more accurate understanding of visual and textual correspondences, and consequently reduce the likelihood of generating hallucinated objects that don't match the context.
+
+\noindent\textbf{Results on POPE.} The Polling-based Object Probing Evaluation (POPE)~\citep{li2023evaluating} is a method for assessing object hallucination in LVLMs. It involves asking LVLMs questions like "Is there a [object] in the image?", with responses alternating between "Yes" and "No," ensuring am equal 50\% probability for each answer. POPE is divided into three splits: random, popular, and adversarial. The random split involves randomly chosen missing objects, the popular split focuses on frequently occurring objects, and the adversarial split targets objects closely related to those in the image. The evaluation uses 500 randomly selected images from the MSCOCO~\citep{Chen2015MicrosoftCC} validation set. The scores, including precision, recall, F1 score, accuracy, and yes ratio, are averaged across the three splits and presented in \tabref{tab:pope}. The proposed \algname consistently outperforms all the baselines in accuracy and F1 score, indicating the model's effectiveness in mitigating object hallucinations.

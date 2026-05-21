@@ -1,0 +1,94 @@
+\section{Ablation and Analysis}
+\begin{figure*}[t]
+    \centering
+    % \hspace{0.2in}MSCOCO~\citep{Chen2015MicrosoftCC} \hspace{2.5in} Flickr30K~\citep{flickrentitiesijcv} \\
+    \hspace{0.5in}MSCOCO~\citep{Chen2015MicrosoftCC} \hspace{1in} Flickr30K~\citep{flickrentitiesijcv} \\\includegraphics[width=0.248\textwidth]{fig/coco_umap.pdf}
+    \includegraphics[width=0.243\textwidth]{fig/coco_tuned_umap.pdf}  
+    \includegraphics[width=0.243\textwidth]{fig/flickr_umap.pdf}
+    \includegraphics[width=0.243\textwidth]{fig/flickr_tuned_umap.pdf}
+    % LLaVA-OV~\citep{li2024llava}\hspace{1in}\algname \hspace{1in} LLaVA-OV~\citep{li2024llava} \hspace{1in} \algname 
+    LLaVA-OV~\citep{li2024llava}\hspace{0.5in}\algname \hspace{0.6in} LLaVA-OV~\citep{li2024llava} \hspace{0.4in} \algname \hspace{0.4in}
+    
+    \caption{Scatter plots of image-text embeddings from MSCOCO~\citep{Chen2015MicrosoftCC} and Flickr30K~\citep{flickrentitiesijcv} datasets. \algname removes the existing modality gap in multimodal representation space.}
+    \label{fig:gap}
+    % \vspace{-0.1in}
+\end{figure*}
+\subsection{Ablation on Training Objectives}
+\begin{table}[t]
+\centering
+\caption{
+    Performance comparison across varying weights for language modeling ($\alpha_{\text{lm}}$) and contrastive ($\alpha_{\text{con}}$) objectives.
+    %
+    Zero-shot retrieval recall@1 is reported for image-to-text (I2T) and text-to-image (T2I) tasks on the Flickr and MSCOCO datasets, alongside multimodal understanding scores on MMMU and MMStar. 
+    %
+    A ratio of 0 indicates training solely with contrastive loss, while a ratio of 1 implies equal emphasis on both objectives.
+}
+\setlength{\tabcolsep}{4pt}
+% \renewcommand{\arraystretch}{1.1}
+% \resizebox{\linewidth}{!}{
+\begin{tabular}{ccccccc}
+\toprule
+\multicolumn{1}{c}{$\alpha_{\text{lm}}:\alpha_{\text{con}}$} 
+& \multicolumn{2}{c}{Flickr} 
+& \multicolumn{2}{c}{MSCOCO} 
+& MMMU & MMStar \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+& I2T & T2I & I2T & T2I & & \\
+\midrule
+0 & 89.0 & 75.0 & 67.0 & 49.6 & 44.4 & 53.9 \\
+0.05 & 88.3 & 75.8 & 65.3 & 48.6 & 47.0 & 56.5 \\
+0.1 & 87.5 & 75.3 & 64.4 & 47.9 & 47.0 & 56.8 \\
+0.2 & 87.0 & 74.7 & 63.3 & 47.0 & 47.4 & 57.3 \\
+1 & 84.9 & 73.2 & 61.1 & 45.1 & 47.4 & 57.1 \\
+\bottomrule
+\end{tabular}
+% }
+% \vspace*{-\baselineskip}
+\label{tab:loss}
+\end{table}
+%
+% \begin{table}[t]
+% \centering
+% \setlength{\tabcolsep}{5pt}
+% \renewcommand{\arraystretch}{1.1}
+% \resizebox{\linewidth}{!}{
+% \begin{tabular}{ccccccc}
+% \toprule
+% $\alpha_{\text{lm}}:\alpha_{\text{con}}$ 
+% &\multicolumn{2}{c}{Flickr}
+% &\multicolumn{2}{c}{MSCOCO} 
+% & MMMU & MMStar  \\
+% \midrule
+% &I2T &T2I &I2T &T2I &Score &Score  \\
+% \midrule
+% 0 & 89.0 & 75.0 & 67.0 & 49.6 & 44.4 & 53.9 \\
+% 0.05 & 88.3 & 75.8 & 65.3 & 48.6 & 47.0 & 56.5 \\
+% 0.1 & 87.5 & 75.3 & 64.4 & 47.9 & 47.0 & 56.8 \\
+% 0.2 & 87.0 & 74.7 & 63.3 & 47.0 & 47.4 & 57.3 \\
+% 1 &	84.9 &	73.2 & 61.1	& 45.1	& 47.4	& 57.1 \\
+% \bottomrule
+% \end{tabular}
+% }
+% \caption{
+%     Different weights of training objectives. 
+%     %
+%     Results on zero-shot retrieval recall@1 for both image-to-text (I2T) and text-to-image (T2I) on Flickr and MSCOCO and multimodal understanding on MMMU and MMStar are reported. 
+%     %
+%     A ratio of 0 means no langage modeling loss, and the model is trained on contrastive loss only. 
+% }
+% \label{tab:loss}
+% \end{table}
+% %
+
+We study the effects of two training objectives and compare different variants of the model in \figref{tab:loss}. Given that the scale of the contrastive loss is one-tenth that of the language modeling loss, we experimented with different weightings for the losses, specifically using ratios of  $\alpha_{\text{lm}}:\alpha_{\text{con}}$ = 0, 0.02, 0.1, 0.2, and 1. Among them, $\alpha_{\text{lm}}:\alpha_{\text{con}}$ = 0 is the case where the model is trained using only the contrastive loss and $\alpha_{\text{lm}} = 0$. Results indicate that generally a larger contrastive loss leads to better representation abilities but worse performance on multimodal understanding tasks. We present a trade-off between representation abilities and generation abilities.  
+
+\subsection{Modality Gap}
+
+Modality gap~\citep{liang2022mind} refers to a geometric phenomenon in the representation spaces of multimodal models, where different data modalities, such as images and texts, are embedded at a significant distance from each other, rather than being uniformly distributed as ideally expected. 
+This gap, which originates from initialization and persists throughout the contrastive learning process (as seen in models like CLIP~\citep{radford2021learning}), presents a challenge for language-image pretraining by affecting joint data modeling and understanding. Recent studies~\citep{srivastava2024omnivec,oh2024geodesic} suggest that narrowing this gap could improve multimodal representations and enhance performance in downstream tasks. 
+
+We analyze the modality gaps in the multimodal embedding space of the proposed \algname by visualizing the embeddings of 250 randomly selected image-text pairs in MSCOCO and Flickr datasets. Following~\citep{liang2022mind}, we adopt UMAP~\citep{mcinnes2018umap} to reduce the dimensionality of the embeddings to 2 and  
+compare the embeddings of the proposed method with LLaVA-OV~\citep{li2024llava} in \figref{fig:gap}.
+As shown in the figure, even though LLaVA-OV~\citep{li2024llava} generated both text and image embeddings using the same model, there exists a significant modality gap between text and images. 
+In contrast, after finetuning with contrastive-autoregressvie loss, the proposed model, \algname, removes this modality gap in the generated embeddings, where embeddings are aligned based on semantic meaning rather than modality.
+%
